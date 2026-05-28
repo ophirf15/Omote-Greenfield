@@ -1,5 +1,16 @@
 # Omote-Greenfield
-A more easily configurable firmware for the Omote Remote
+A from-scratch, configurable firmware for the OMOTE open universal remote hardware.
+
+This project is designed for the OMOTE hardware platform originally created by Maximilian Kern / the OMOTE Community.
+
+It is not the official OMOTE firmware and is not affiliated with or endorsed by the original OMOTE maintainers unless stated otherwise.
+
+## Credits
+
+- Original OMOTE hardware and firmware project: OMOTE Community
+- Original creator/project: Maximilian Kern
+- Portions of this project were inspired by or adapted from the original OMOTE firmware.
+- Original OMOTE firmware is licensed under GPL-3.0.
 =======
 # Omote OS
 
@@ -36,4 +47,6 @@ First boot: connect to WiFi AP **Omote-Setup**, configure SSID/password, then op
 
 ## License
 
-MIT — hardware pin reference derived from OMOTE community docs; no GPLv3 firmware code copied.
+This project is licensed under GPL-3.0. See `LICENSE`.
+
+Because this firmware includes or adapts portions of the original OMOTE firmware, it is distributed under GPL-3.0.
