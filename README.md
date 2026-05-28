@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Omote-Greenfield
 A more easily configurable firmware for the Omote Remote
 =======
@@ -38,4 +37,3 @@ First boot: connect to WiFi AP **Omote-Setup**, configure SSID/password, then op
 ## License
 
 MIT — hardware pin reference derived from OMOTE community docs; no GPLv3 firmware code copied.
->>>>>>> da6a650 (Initial Commit)
