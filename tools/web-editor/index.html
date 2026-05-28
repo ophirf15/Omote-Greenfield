@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Omote OS</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header>
+    <h1>Omote OS</h1>
+    <nav id="nav">
+      <button data-tab="setup" class="active">Setup</button>
+      <button data-tab="layout">Layout</button>
+      <button data-tab="ir">IR library</button>
+      <button data-tab="keys">Physical keys</button>
+      <button data-tab="device">Device</button>
+      <button data-tab="ble">Bluetooth</button>
+    </nav>
+    <div id="status-bar"></div>
+  </header>
+  <main>
+    <section id="tab-setup" class="tab active">
+      <h2>Home Assistant</h2>
+      <label>Device URL <input id="device-url" placeholder="http://omote.local" /></label>
+      <button id="btn-save-device-url">Connect to device</button>
+      <label>HA URL <input id="ha-url" placeholder="http://homeassistant.local:8123" /></label>
+      <label>Long-lived token <input id="ha-token" type="password" /></label>
+      <button id="btn-save-settings">Save settings</button>
+      <button id="btn-test-ha">Test connection</button>
+      <div class="backup-actions">
+        <button id="btn-export-backup">Export all settings</button>
+        <label>Import backup <input type="file" id="backup-file" accept=".json,application/json" /></label>
+      </div>
+      <p id="setup-msg" class="msg"></p>
+    </section>
+    <section id="tab-layout" class="tab">
+      <div class="layout-shell">
+        <aside class="page-sidebar">
+          <h2>Pages</h2>
+          <ul id="page-list"></ul>
+          <div class="page-actions">
+            <button type="button" id="btn-add-page">Add page</button>
+            <button type="button" id="btn-add-hvac-page">Add HVAC page</button>
+            <button type="button" id="btn-add-google-tv">Google TV template</button>
+          </div>
+        </aside>
+        <div class="editor-main">
+          <h2>Layout <span id="editor-page-name"></span></h2>
+          <p id="editing-label" class="muted"></p>
+          <div class="editor-page-nav">
+            <button type="button" id="btn-prev-page" title="Previous page">◀ Page</button>
+            <button type="button" id="btn-next-page" title="Next page">Page ▶</button>
+            <span class="muted">Swipe on device to change pages</span>
+          </div>
+          <div class="editor-layout">
+            <div id="canvas-wrap">
+              <canvas id="preview" width="240" height="320"></canvas>
+            </div>
+            <aside class="props">
+              <label>Label <input id="btn-label" /></label>
+              <label>Widget
+                <select id="btn-widget">
+                  <option value="push">Push</option>
+                  <option value="toggle">Toggle (HA)</option>
+                  <option value="momentary">Momentary</option>
+                  <option value="label">HA Label (state text)</option>
+                  <option value="climate">Climate (compact)</option>
+                  <option value="climate_thermostat">HVAC thermostat (full page)</option>
+                </select>
+              </label>
+              <label class="inline"><input type="checkbox" id="btn-auto-label" checked /> Auto label from HA entity</label>
+              <label class="inline"><input type="checkbox" id="btn-label-below" /> Label below widget</label>
+              <label>Action type
+                <select id="action-type">
+                  <option value="ha_service">Home Assistant</option>
+                  <option value="ble_key">BLE key</option>
+                  <option value="ble_media">BLE media</option>
+                  <option value="ir">Infrared</option>
+                  <option value="navigate_page">Go to page</option>
+                  <option value="open_keyboard">On-screen keyboard</option>
+                </select>
+              </label>
+              <div id="action-ha" class="action-panel">
+                <div class="domain-tabs" id="domain-tabs"></div>
+                <input id="entity-search" placeholder="Search entities..." />
+                <p id="entity-status" class="muted"></p>
+                <select id="entity-pick" size="8"></select>
+                <label>Service
+                  <select id="ha-service">
+                    <option value="toggle">toggle</option>
+                    <option value="turn_on">turn_on</option>
+                    <option value="turn_off">turn_off</option>
+                  </select>
+                </label>
+              </div>
+              <div id="action-ble" class="action-panel hidden">
+                <p class="hint muted">Names match Android <a href="https://developer.android.com/reference/android/view/KeyEvent" target="_blank" rel="noopener">KeyEvent</a>. Streaming apps use <code>KEYCODE_BUTTON_N</code> (gamepad HID); Netflix is usually <code>BUTTON_3</code> on Google TV.</p>
+                <select id="ble-key"></select>
+              </div>
+              <div id="action-ir" class="action-panel hidden">
+                <label>Protocol <input id="ir-protocol" value="NEC" /></label>
+                <label>Code <input id="ir-code" placeholder="0xE0E040BF" /></label>
+                <button id="btn-ir-learn">Learn IR</button>
+                <label>IR Library
+                  <select id="ir-lib-select"></select>
+                </label>
+                <button id="btn-ir-save-lib">Save capture to library</button>
+                <button id="btn-ir-delete-lib">Delete selected library entry</button>
+                <span id="ir-learn-status"></span>
+              </div>
+              <div id="action-nav" class="action-panel hidden">
+                <select id="nav-page"></select>
+              </div>
+              <fieldset class="style-panel">
+                <legend>Style &amp; layout</legend>
+                <label>Background <input type="color" id="btn-bg" value="#3366cc" /></label>
+                <label>Text <input type="color" id="btn-fg" value="#ffffff" /></label>
+                <label>Corner radius <input type="number" id="btn-radius" min="0" max="32" value="8" /></label>
+                <label>Border color <input type="color" id="btn-border" value="#000000" /></label>
+                <label>Border width <input type="number" id="btn-border-w" min="0" max="8" value="0" /></label>
+                <div class="layout-row">
+                  <label>X <input type="number" id="btn-x" min="0" max="240" /></label>
+                  <label>Y <input type="number" id="btn-y" min="0" max="298" /></label>
+                </div>
+                <div class="layout-row">
+                  <label>W <input type="number" id="btn-w" min="20" max="240" /></label>
+                  <label>H <input type="number" id="btn-h" min="16" max="298" /></label>
+                </div>
+                <label class="inline"><input type="checkbox" id="btn-snap-grid" checked /> Snap to 8px grid</label>
+                <label class="inline"><input type="checkbox" id="btn-show-grid" checked /> Show grid</label>
+              </fieldset>
+              <button id="btn-add-button">Add new</button>
+              <button id="btn-update-button" disabled>Update selected</button>
+              <button id="btn-delete-button" disabled>Delete selected</button>
+            </aside>
+          </div>
+          <button id="btn-deploy" class="primary">Deploy to remote</button>
+          <p id="editor-msg" class="msg"></p>
+        </div>
+      </div>
+    </section>
+    <section id="tab-ir" class="tab">
+      <h2>IR library</h2>
+      <p class="hint">Codes are saved on the Omote (<code>/irlib.json</code>) and survive reboot. Export a backup file for safekeeping.</p>
+      <div class="ir-learn-panel">
+        <button type="button" id="btn-ir-tab-learn" class="primary">Learn from remote</button>
+        <span id="ir-tab-learn-status" class="muted">Point another IR remote at the Omote, then press a button on it.</span>
+      </div>
+      <div class="ir-library-toolbar">
+        <button type="button" id="btn-ir-export">Export library</button>
+        <label>Import library <input type="file" id="ir-import-file" accept=".json,application/json" /></label>
+      </div>
+      <ul id="ir-library-list" class="ir-library-list"></ul>
+    </section>
+    <section id="tab-keys" class="tab">
+      <h2>Physical key map — <span id="keymap-page-name"></span></h2>
+      <label>Page <select id="keymap-page"></select></label>
+      <label>Profile
+        <select id="key-profile">
+          <option value="">Custom</option>
+          <option value="google_tv">Google TV</option>
+          <option value="home">Home (1→home, 2→GTV)</option>
+        </select>
+      </label>
+      <button id="btn-apply-profile">Apply profile</button>
+      <button id="btn-learn-key" class="primary">Learn from remote</button>
+      <p id="learn-key-status" class="muted">Click a key on the Omote, or pick one below.</p>
+      <div id="remote-keymap" class="remote-keymap"></div>
+      <div id="key-action-panel" class="hidden">
+        <p>Key: <strong id="key-selected-label"></strong></p>
+        <select id="key-action-type">
+          <option value="ble_key">BLE key</option>
+          <option value="navigate_page">Navigate page</option>
+          <option value="ha_service">HA service</option>
+          <option value="ir">Infrared (library)</option>
+        </select>
+        <p class="hint muted">Streaming shortcuts send KEYCODE_BUTTON_N (e.g. Netflix → BUTTON_3). Re-pair BLE after firmware update.</p>
+        <select id="key-ble-key"></select>
+        <select id="key-nav-page"></select>
+        <div id="key-ha-wrap" class="action-panel hidden">
+          <p class="hint muted">Momentary key press — pick entity and service.</p>
+          <div class="domain-tabs" id="key-domain-tabs"></div>
+          <input id="key-entity-search" placeholder="Search entities..." />
+          <p id="key-entity-status" class="muted"></p>
+          <select id="key-entity-pick" size="6"></select>
+          <label>Service
+            <select id="key-ha-service">
+              <option value="toggle">toggle</option>
+              <option value="turn_on">turn_on</option>
+              <option value="turn_off">turn_off</option>
+            </select>
+          </label>
+        </div>
+        <label id="key-ir-wrap" class="hidden">IR library
+          <select id="key-ir-lib"></select>
+        </label>
+        <button id="btn-assign-key">Assign</button>
+        <button id="btn-clear-key">Clear</button>
+      </div>
+      <button id="btn-save-keymap" class="primary">Save &amp; deploy</button>
+    </section>
+    <section id="tab-device" class="tab">
+      <h2>Device settings</h2>
+      <div id="device-status"></div>
+      <label>Brightness <input type="range" id="dev-brightness" min="10" max="255" /></label>
+      <label>Screen off after (sec) <input type="number" id="dev-display-timeout" min="10" max="3600" /></label>
+      <p class="hint">WiFi and web UI stay on while the screen is off.</p>
+      <label>Deep sleep after (sec) <input type="number" id="dev-deep-sleep" min="120" max="86400" /></label>
+      <p class="hint">Full sleep to save battery; wake with key, touch, or motion. Default 900 (15 min).</p>
+      <label><input type="checkbox" id="dev-motion" /> Motion wake</label>
+      <button id="btn-save-device">Save device settings</button>
+      <h3>Bluetooth</h3>
+      <p class="hint muted">Forget bonds before pairing Google TV if a phone keeps reconnecting.</p>
+      <div id="device-ble-status" class="muted">—</div>
+      <div class="ble-device-actions">
+        <button type="button" id="btn-device-ble-refresh">Refresh BLE</button>
+        <button type="button" id="btn-device-ble-pair">Start pairing</button>
+        <button type="button" id="btn-device-ble-disconnect">Disconnect</button>
+        <button type="button" id="btn-device-ble-forget">Forget all devices</button>
+      </div>
+      <p id="device-ble-msg" class="msg"></p>
+      <button id="btn-reboot">Reboot</button>
+      <button id="btn-display-off">Display off</button>
+      <button id="btn-deep-sleep">Deep sleep</button>
+      <h3>Debug log</h3>
+      <pre id="debug-log"></pre>
+      <button id="btn-refresh-log">Refresh log</button>
+    </section>
+    <section id="tab-ble" class="tab">
+      <h2>Bluetooth HID</h2>
+      <p>Pair Google TV with <strong>Omote Remote</strong>. On the TV: Settings → Remotes → Add accessory.</p>
+      <div id="ble-status" class="muted">Checking…</div>
+      <div class="ble-device-actions">
+        <button type="button" id="btn-refresh-ble">Refresh</button>
+        <button type="button" id="btn-ble-pair">Start pairing</button>
+        <button type="button" id="btn-ble-disconnect">Disconnect</button>
+        <button type="button" id="btn-ble-forget">Forget all devices</button>
+      </div>
+      <p id="ble-tab-msg" class="msg"></p>
+      <h3>HID identity</h3>
+      <p class="hint">
+        Selects which <code>Vendor_VVVV_Product_PPPP.kl</code> keylayout Android
+        loads, and therefore which <code>KEYCODE_*</code> values the TV reports
+        for our buttons. <strong>Generic</strong> recovers the largest set of
+        remote keys (NOTIFICATION / PROFILE_SWITCH / colour keys /
+        Netflix-YouTube-Prime-Disney shortcuts). Changing the identity
+        invalidates the existing bond — Omote forgets its side automatically;
+        you must also forget the old bond on the TV and re-pair.
+      </p>
+      <label>Identity
+        <select id="ble-identity-select"></select>
+      </label>
+      <p id="ble-identity-desc" class="hint muted"></p>
+      <button type="button" id="btn-ble-identity-apply" class="primary">Apply &amp; re-pair</button>
+      <p id="ble-identity-msg" class="msg"></p>
+      <h3>HID test bench</h3>
+      <p class="hint">
+        Send a raw HID code to the paired TV without using a Page action. Useful
+        for discovering which codes the TV's keylayout actually accepts. Watch
+        the result in your Android keymapper app or
+        <code>adb shell getevent -lq</code>.
+      </p>
+      <label>Consumer Page usage (hex)
+        <input type="text" id="ble-test-usage" placeholder="0x02A2" />
+      </label>
+      <button type="button" id="btn-ble-test-usage">Send usage</button>
+      <label>Button (1..16)
+        <input type="number" id="ble-test-button" min="1" max="16" placeholder="3" />
+      </label>
+      <button type="button" id="btn-ble-test-button">Send BUTTON_N</button>
+      <p id="ble-test-msg" class="msg"></p>
+    </section>
+  </main>
+  <script src="./app.js?v=31"></script>
+</body>
+</html>

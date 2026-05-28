@@ -1,0 +1,4 @@
+DOMAIN = "omote_remote"
+CONF_HOST = "host"
+DEFAULT_PORT = 80
+UPDATE_INTERVAL = 30

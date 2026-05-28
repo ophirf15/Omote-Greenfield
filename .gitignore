@@ -1,0 +1,9 @@
+.pio/
+.vscode/.browse*
+web/node_modules/
+web/dist/
+firmware/.pio/
+*.pyc
+__pycache__/
+.DS_Store
+firmware/src/secrets.h

@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Omote Setup</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 520px; margin: 2rem auto; padding: 0 1rem; background: #111; color: #eee; }
+    h1 { font-size: 1.4rem; }
+    label { display: block; margin: 1rem 0 0.3rem; }
+    input { width: 100%; padding: 0.5rem; box-sizing: border-box; }
+    button { margin-top: 1rem; padding: 0.6rem 1rem; background: #3366cc; color: #fff; border: 0; border-radius: 6px; cursor: pointer; }
+    .muted { color: #999; font-size: 0.9rem; }
+    #msg { margin-top: 1rem; }
+    code { background: #222; padding: 0.1rem 0.3rem; border-radius: 4px; }
+    .ble-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .ble-actions button { margin-top: 0; flex: 1 1 auto; min-width: 120px; }
+    #ble-box { margin: 8px 0; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>Omote Setup</h1>
+  <p class="muted">This page configures WiFi and Home Assistant on the device. Use the full layout editor on your PC.</p>
+  <p>Device: <strong id="ip">…</strong></p>
+  <label>Home Assistant URL<input id="ha-url" placeholder="http://homeassistant.local:8123" /></label>
+  <label>Long-lived token<input id="ha-token" type="password" placeholder="(unchanged if empty)" /></label>
+  <button id="btn-save">Save settings</button>
+  <p id="msg" class="muted"></p>
+  <hr />
+  <h2>Bluetooth (Google TV / phone)</h2>
+  <p class="muted">If your phone keeps reconnecting, forget bonds here first, then pair the TV.</p>
+  <div id="ble-box" class="muted">Loading BLE status…</div>
+  <div class="ble-actions">
+    <button type="button" id="btn-ble-refresh">Refresh</button>
+    <button type="button" id="btn-ble-pair">Start pairing</button>
+    <button type="button" id="btn-ble-disconnect">Disconnect</button>
+    <button type="button" id="btn-ble-forget">Forget all devices</button>
+  </div>
+  <p id="ble-msg" class="muted"></p>
+  <hr />
+  <h2>Layout editor</h2>
+  <p class="muted">Run from the Omote repo on your computer:</p>
+  <pre><code>cd tools/web-editor
+python -m http.server 8080</code></pre>
+  <p>Then open <a id="editor-link" href="http://localhost:8080" target="_blank">http://localhost:8080</a> and set device URL to <code id="device-url">http://omote.local</code>.</p>
+  <p><a href="/api/device/mem" target="_blank">Memory stats</a> · <a href="/api/config" target="_blank">Config JSON</a></p>
+  <script>
+    const base = location.origin;
+    document.getElementById('ip').textContent = base;
+    document.getElementById('device-url').textContent = base;
+    async function api(path, opts = {}) {
+      const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+      const t = await r.text();
+      let d; try { d = JSON.parse(t); } catch { d = t; }
+      if (!r.ok) throw new Error(d?.error || t);
+      return d;
+    }
+    async function load() {
+      try {
+        const s = await api('/api/settings');
+        document.getElementById('ha-url').value = s.ha_url || '';
+      } catch (_) {}
+    }
+    document.getElementById('btn-save').onclick = async () => {
+      const msg = document.getElementById('msg');
+      try {
+        const body = { ha_url: document.getElementById('ha-url').value.trim() };
+        const tok = document.getElementById('ha-token').value.trim();
+        if (tok) body.ha_token = tok;
+        await api('/api/settings', { method: 'POST', body: JSON.stringify(body) });
+        msg.textContent = 'Saved.';
+      } catch (e) {
+        msg.textContent = e.message;
+      }
+    };
+    function bleStatusHtml(b) {
+      const lines = [
+        'Connected: ' + (b.connected ? 'yes' : 'no'),
+        'Discoverable: ' + (b.advertising ? 'yes' : 'no'),
+        'Pairing mode: ' + (b.pairing_mode ? 'on' : 'off'),
+        'Bonded devices: ' + (b.bond_count || 0),
+      ];
+      if (b.bonds && b.bonds.length) lines.push('Bonds: ' + b.bonds.join(', '));
+      return lines.join('<br>');
+    }
+    async function refreshBle() {
+      const box = document.getElementById('ble-box');
+      try {
+        const b = await api('/api/ble/status');
+        box.innerHTML = bleStatusHtml(b);
+      } catch (e) {
+        box.textContent = e.message;
+      }
+    }
+    async function bleAction(path, okMsg) {
+      const msg = document.getElementById('ble-msg');
+      try {
+        const b = await api(path, { method: 'POST' });
+        document.getElementById('ble-box').innerHTML = bleStatusHtml(b);
+        msg.textContent = okMsg;
+      } catch (e) {
+        msg.textContent = e.message;
+      }
+    }
+    document.getElementById('btn-ble-refresh').onclick = refreshBle;
+    document.getElementById('btn-ble-pair').onclick = () =>
+      bleAction('/api/ble/start', 'Pairing on — add “Omote Remote” on your Google TV.');
+    document.getElementById('btn-ble-disconnect').onclick = () =>
+      bleAction('/api/ble/disconnect', 'Disconnected active BLE clients.');
+    document.getElementById('btn-ble-forget').onclick = async () => {
+      if (!confirm('Forget all paired phones/TVs? You will need to pair again.')) return;
+      await bleAction('/api/ble/forget', 'Bonds cleared. Pair your Google TV now.');
+    };
+    load();
+    refreshBle();
+  </script>
+</body>
+</html>
