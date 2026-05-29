@@ -11,6 +11,7 @@
 #include "net/debug_log.h"
 #include "net/ha_client.h"
 #include "net/net_worker.h"
+#include "net/time_sync.h"
 #include "ui_runtime/page_engine.h"
 #include <ESP.h>
 #include <WebServer.h>
@@ -25,11 +26,21 @@ static DeviceSettings *gDevSettings = nullptr;
 static ConfigChangedCallback gOnChange;
 static bool gServerUp = false;
 
+static void httpCloseClient() {
+  WiFiClient client = server.client();
+  if (client && client.connected()) client.stop();
+}
+
 static void sendJson(int code, const String &body) {
   netWorkerTouchWebClient();
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Connection", "close");
-  server.send(code, "application/json", body);
+  if (body.length() == 0) {
+    server.send(code, "application/json", "{}");
+  } else {
+    server.send(code, "application/json", body);
+  }
+  httpCloseClient();
 }
 
 static String gLastEventJson = "{}";
@@ -104,6 +115,7 @@ static void handleStatic() {
     yield();
   }
   f.close();
+  httpCloseClient();
 }
 
 static void serializeConfig(JsonDocument &doc, const OmoteConfig &cfg) {
@@ -430,6 +442,7 @@ static void handleConfigGet() {
     yield();
   }
   f.close();
+  httpCloseClient();
 }
 
 static bool gConfigDeployBusy = false;
@@ -542,8 +555,13 @@ static void handleDeviceSettingsGet() {
     doc["deep_sleep_timeout_ms"] = gDevSettings->deepSleepTimeoutMs;
     doc["sleep_timeout_ms"] = gDevSettings->displayTimeoutMs;
     doc["motion_wake_enabled"] = gDevSettings->motionWake;
+    doc["timezone"] = gDevSettings->timezone;
+    doc["ntp_server"] = gDevSettings->ntpServer;
     doc["display_off"] = displayIsOff();
   }
+  doc["time_synced"] = timeIsSynced();
+  char iso[24];
+  if (timeGetLocalIso(iso, sizeof(iso))) doc["device_time"] = iso;
   doc["battery_percent"] = batteryPercent();
   doc["battery_charging"] = batteryCharging();
   doc["wifi_connected"] = WiFi.status() == WL_CONNECTED;
@@ -585,6 +603,21 @@ static void handleDeviceSettingsPost() {
     if (!doc["motion_wake_enabled"].isNull()) {
       gDevSettings->motionWake = doc["motion_wake_enabled"] | true;
       sleepSetMotionWake(gDevSettings->motionWake);
+    }
+    bool clockChanged = false;
+    if (!doc["timezone"].isNull()) {
+      gDevSettings->timezone = doc["timezone"].as<String>();
+      if (!gDevSettings->timezone.length()) gDevSettings->timezone = "UTC0";
+      clockChanged = true;
+    }
+    if (!doc["ntp_server"].isNull()) {
+      gDevSettings->ntpServer = doc["ntp_server"].as<String>();
+      if (!gDevSettings->ntpServer.length()) gDevSettings->ntpServer = "pool.ntp.org";
+      clockChanged = true;
+    }
+    if (clockChanged) {
+      timeSetTimezone(gDevSettings->timezone);
+      timeForceResync();
     }
   deviceSettingsSave(*gDevSettings);
   sendJson(200, "{\"ok\":true}");
@@ -834,21 +867,26 @@ void httpServerBegin(HaSettings &settings, OmoteConfig &config, DeviceSettings &
   server.onNotFound([]() {
     if (server.method() == HTTP_OPTIONS) {
       server.sendHeader("Access-Control-Allow-Origin", "*");
-      server.send(204);
+      server.sendHeader("Connection", "close");
+      server.send(204, "text/plain", "");
+      httpCloseClient();
       return;
     }
     if (server.uri().startsWith("/api/")) {
       Serial.printf("HTTP 404 api: %s\n", server.uri().c_str());
-      server.send(404, "application/json", "{\"error\":\"not found\"}");
+      sendJson(404, "{\"error\":\"not found\"}");
       return;
     }
     if (server.uri() == "/favicon.ico") {
-      server.send(204);
+      server.sendHeader("Connection", "close");
+      server.send(204, "text/plain", "");
+      httpCloseClient();
       return;
     }
     handleStatic();
   });
 
+  server.enableDelay(false);
   server.begin();
   gServerUp = true;
   Serial.println("HTTP server started on :80");

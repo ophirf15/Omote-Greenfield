@@ -509,6 +509,8 @@ bool deviceSettingsLoad(DeviceSettings &ds) {
   ds.motionWake = doc["motion_wake_enabled"] | true;
   ds.haPollEnabled = doc["ha_poll_enabled"] | false;
   ds.bleProfile = doc["ble_profile"] | "generic";
+  ds.timezone = doc["timezone"] | "UTC0";
+  ds.ntpServer = doc["ntp_server"] | "pool.ntp.org";
 
   uint32_t display = doc["display_timeout_ms"] | 0;
   uint32_t deep = doc["deep_sleep_timeout_ms"] | 0;
@@ -539,6 +541,8 @@ bool deviceSettingsSave(const DeviceSettings &ds) {
   doc["motion_wake_enabled"] = ds.motionWake;
   doc["ha_poll_enabled"] = ds.haPollEnabled;
   doc["ble_profile"] = ds.bleProfile;
+  doc["timezone"] = ds.timezone;
+  doc["ntp_server"] = ds.ntpServer;
   return writeJsonFile(DEVICE_SETTINGS_PATH, doc);
 }
 

@@ -74,7 +74,7 @@ static lv_obj_t *makeDomainBadge(lv_obj_t *parent, const String &entityId) {
 }
 
 static bool loadCachedRgb(const String &path, std::vector<uint16_t> &pixels) {
-  if (path.length() == 0) return false;
+  if (path.length() == 0 || !LittleFS.exists(path)) return false;
   File f = LittleFS.open(path, "r");
   if (!f || f.size() < 8) return false;
   char magic[4];
@@ -242,11 +242,15 @@ void haIconLoop() {
 lv_obj_t *haIconAttach(lv_obj_t *parent, const String &entityId, const String &mdiIcon) {
   std::vector<uint16_t> px;
   bool haveImg = false;
+#if OMOTE_ICON_FETCH_ENABLED
   if (isValidMdiIcon(mdiIcon)) {
     const String path = iconCachePath(mdiIcon);
     haveImg = loadCachedRgb(path, px);
     if (!haveImg) haIconQueueFetch(mdiIcon);
   }
+#else
+  (void)mdiIcon;
+#endif
   if (!haveImg) return makeDomainBadge(parent, entityId);
 
   IconInstance inst;

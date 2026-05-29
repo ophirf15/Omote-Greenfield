@@ -15,6 +15,7 @@
 #include "net/debug_log.h"
 #include "net/http_server.h"
 #include "net/net_worker.h"
+#include "net/time_sync.h"
 #include "ui_runtime/page_engine.h"
 
 static HaSettings gHaSettings;
@@ -89,6 +90,7 @@ static void startNetworkServices() {
   servicesStarted = true;
   delay(300);
   WiFi.setTxPower(WIFI_POWER_15dBm);
+  timeStartSync(gDevSettings.timezone, gDevSettings.ntpServer);
   httpServerBegin(gHaSettings, gConfig, gDevSettings, onConfigChanged);
   Serial.println("Ready — http://omote.local or device IP");
 }
@@ -204,6 +206,7 @@ void loop() {
     powerBtnLoop(onKeypad);
   }
   httpServerLoop();
+  timeSyncLoop();
   bleTaskLoop();
 
   static uint32_t activityTimer = 0;

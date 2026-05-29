@@ -3,22 +3,24 @@
 #include <Arduino.h>
 
 /**
- * Lightweight wrapper around the ESP-IDF SNTP client. Stores the user's
- * preferred timezone (POSIX TZ string, e.g. "PST8PDT,M3.2.0,M11.1.0") and
- * NTP server in DeviceSettings; the SNTP daemon then re-syncs in the
- * background at the IDF's default cadence (one hour).
+ * Lightweight UDP NTP client with integer-only local-time math (no newlib TZ).
+ * Stores the user's preferred timezone (POSIX TZ string) and NTP server in
+ * DeviceSettings; re-syncs hourly while WiFi is up.
  */
 
-/** Configure SNTP + apply timezone. Safe to call multiple times. */
+/** Configure NTP + apply timezone. Safe to call multiple times. */
 void timeStartSync(const String &posixTz, const String &ntpServer);
 
 /** Update only the timezone — for use when the user changes it in WebUI. */
 void timeSetTimezone(const String &posixTz);
 
-/** Force a fresh SNTP query without changing timezone or server. */
+/** Force a fresh NTP query without changing timezone or server. */
 void timeForceResync();
 
-/** True once at least one SNTP packet has landed. */
+/** Call from main loop — hourly re-sync while WiFi is connected. */
+void timeSyncLoop();
+
+/** True once at least one NTP packet has landed. */
 bool timeIsSynced();
 
 /** "HH:MM" (24h) — returns false if not yet synced. */

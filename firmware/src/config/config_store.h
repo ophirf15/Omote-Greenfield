@@ -80,6 +80,9 @@ struct DeviceSettings {
    * so the user must forget+re-pair on both ends.
    */
   String bleProfile = "generic";
+  /** POSIX TZ string, e.g. "PST8PDT,M3.2.0,M11.1.0". */
+  String timezone = "UTC0";
+  String ntpServer = "pool.ntp.org";
 };
 
 struct OmoteConfig {

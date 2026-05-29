@@ -12,6 +12,7 @@
 #include "net/ha_client.h"
 #include "hal/ha_icon_hal.h"
 #include "net/net_worker.h"
+#include "net/time_sync.h"
 #include "hal/pins.h"
 #include <ArduinoJson.h>
 #include <math.h>
@@ -41,6 +42,8 @@ static lv_obj_t *gBleStatusLbl = nullptr;
 static uint8_t gKbLayer = 0;
 static bool gKbShift = false;
 static uint32_t sLastHaPoll = 0;
+static uint32_t sSavePageDeadline = 0;
+static uint32_t sLastCycleMs = 0;
 static bool sHaSyncInProgress = false;
 static volatile bool sReloadPending = false;
 static size_t sSkipToggleSyncIdx = SIZE_MAX;
@@ -623,11 +626,14 @@ void pageEngineOnSwipeDrag(int dx, int dy) {
 static void saveActivePage() {
   if (gCfg && gExec) {
     gCfg->activePageId = gExec->activePageId();
-    configSave(*gCfg);
+    sSavePageDeadline = millis() + 3000;
   }
 }
 static void cyclePage(int dir) {
   if (!gCfg || !gExec || gCfg->pages.size() < 2) return;
+  const uint32_t now = millis();
+  if (now - sLastCycleMs < 600) return;
+  sLastCycleMs = now;
   int idx = configPageIndex(*gCfg, gExec->activePageId());
   if (idx < 0) idx = 0;
   idx = (idx + dir + (int)gCfg->pages.size()) % (int)gCfg->pages.size();
@@ -635,12 +641,6 @@ static void cyclePage(int dir) {
   saveActivePage();
   sleepNotifyActivity();
   pageEngineReload();
-}
-static void onSwipe(lv_event_t *e) {
-  (void)e;
-  lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_get_act());
-  if (dir == LV_DIR_LEFT) cyclePage(1);
-  else if (dir == LV_DIR_RIGHT) cyclePage(-1);
 }
 static bool runButtonAction(const ButtonDef &btn) {
   if (!gExec) return false;
@@ -957,13 +957,16 @@ static void buildStatusBar() {
   lv_label_set_text(gBatIconLbl, batterySymbolFor(pct, charging));
   lv_obj_set_style_text_color(gBatIconLbl, lv_color_hex(batteryColorFor(pct, charging)), 0);
   lv_label_set_text(gBatLbl, (String(pct) + "%").c_str());
-  /* Clock — only render once SNTP has supplied a real time. */
-  char clockBuf[8] = {0};
-  if (timeGetLocalHm(clockBuf, sizeof(clockBuf))) {
-    lv_label_set_text(gClockLbl, clockBuf);
-  }
   const PageDef *p = gCfg ? configFindPage(*gCfg, gExec ? gExec->activePageId() : "") : nullptr;
   lv_label_set_text(gTitleLbl, p ? p->name.c_str() : "Omote");
+  if (gClockLbl) {
+    char hm[8];
+    if (timeGetLocalHm(hm, sizeof(hm))) {
+      lv_label_set_text(gClockLbl, hm);
+    } else {
+      lv_label_set_text(gClockLbl, "");
+    }
+  }
 }
 static void buildSettingsPanel() {
   if (gSettingsPanel) lv_obj_del(gSettingsPanel);
@@ -1057,13 +1060,11 @@ void pageEngineInit(OmoteConfig *config, ActionExecutor *executor) {
   lv_obj_set_style_bg_color(gScreen, lv_color_hex(0x111111), 0);
   stripContainerStyle(gScreen);
   lv_obj_add_flag(gScreen, LV_OBJ_FLAG_GESTURE_BUBBLE);
-  lv_obj_add_event_cb(gScreen, onSwipe, LV_EVENT_GESTURE, nullptr);
   gContent = lv_obj_create(gScreen);
   lv_obj_set_size(gContent, SCR_WIDTH, SCR_HEIGHT - STATUS_BAR_H);
   lv_obj_set_pos(gContent, 0, STATUS_BAR_H);
   lv_obj_set_style_bg_opa(gContent, LV_OPA_TRANSP, 0);
   stripContainerStyle(gContent);
-  lv_obj_add_event_cb(gContent, onSwipe, LV_EVENT_GESTURE, nullptr);
   tuneTouchGestures();
   pageEngineReload();
 }
@@ -1297,7 +1298,6 @@ void pageEngineReload() {
       gWidgets.push_back(w);
     }
   }
-  pageEngineSyncHaBatch(4);
   sLastHaPoll = millis();
 }
 void pageEngineAfterAction(bool pageChanged) {
@@ -1313,14 +1313,26 @@ void pageEngineLoop() {
     sReloadPending = false;
     pageEngineReload();
   }
+  if (sSavePageDeadline && millis() >= sSavePageDeadline) {
+    sSavePageDeadline = 0;
+    if (gCfg) configSave(*gCfg);
+  }
   if (displayIsOff()) return;
   lv_timer_handler();
   if (wifiIsConnected() && gOverlayMsg) pageEngineReload();
   static uint32_t lastBar = 0;
-  if (millis() - lastBar > 5000) {
-    lastBar = millis();
+  static uint32_t lastClock = 0;
+  const uint32_t now = millis();
+  if (now - lastBar > 5000) {
+    lastBar = now;
     buildStatusBar();
     displayPump();
+  } else if (gClockLbl && now - lastClock > 1000) {
+    lastClock = now;
+    char hm[8];
+    if (timeGetLocalHm(hm, sizeof(hm))) {
+      lv_label_set_text(gClockLbl, hm);
+    }
   }
   if (gHaSettings && gHaSettings->configured && wifiIsConnected() && !netWorkerWebUiActive() &&
       (!gToggles.empty() || !gHaLabels.empty() || !gHaClimates.empty() || gThermostat.panel) &&
