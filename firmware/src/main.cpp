@@ -17,6 +17,9 @@
 #include "net/net_worker.h"
 #include "net/runtime_diag.h"
 #include "net/time_sync.h"
+#include "net/ha_async_worker.h"
+#include "net/ha_websocket.h"
+#include "net/net_heap.h"
 #include "ui_runtime/page_engine.h"
 
 static HaSettings gHaSettings;
@@ -51,9 +54,25 @@ static void printBootReason() {
   Serial.printf("Reset reason: %s (%d)\n", reason, (int)r);
 }
 
+static bool littlefsWritable() {
+  File t = LittleFS.open("/.wr_test", "w");
+  if (!t) return false;
+  t.print('1');
+  t.close();
+  LittleFS.remove("/.wr_test");
+  return true;
+}
+
 static bool mountLittleFS() {
-  if (LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
+  const char *mountPoint = "/littlefs";
+  const char *label = "littlefs";
+  if (LittleFS.begin(false, mountPoint, 10, label) && littlefsWritable()) {
     Serial.println("LittleFS mounted");
+    return true;
+  }
+  if (LittleFS.begin(false, mountPoint, 10, label)) LittleFS.end();
+  if (LittleFS.begin(true, mountPoint, 10, label)) {
+    Serial.println("LittleFS mounted (formatted)");
     return true;
   }
   Serial.println("LittleFS mount failed");
@@ -93,6 +112,9 @@ static void startNetworkServices() {
   WiFi.setTxPower(WIFI_POWER_15dBm);
   timeStartSync(gDevSettings.timezone, gDevSettings.ntpServer);
   httpServerBegin(gHaSettings, gConfig, gDevSettings, onConfigChanged);
+  haWsSetSettings(&gHaSettings);
+  haWsOnWifiUp();
+  pageEngineNotifyNetworkReady();
   Serial.println("Ready — http://omote.local or device IP");
 }
 
@@ -107,6 +129,9 @@ void setup() {
 
   mountLittleFS();
   netWorkerInit();
+  haAsyncInit();
+  haWsInit();
+  haWsStartTask();
   sleepInitWakeup();
 
   pinMode(PIN_USER_LED, OUTPUT);
@@ -212,8 +237,19 @@ void loop() {
   }
   diagSetStage("http");
   httpServerLoop();
+  {
+    static bool sMemPressure = false;
+    if (!netHeapOkForHa()) {
+      if (!sMemPressure) {
+        sMemPressure = true;
+        haWsReleasePressure();
+      }
+    } else if (netHeapComfortable()) {
+      sMemPressure = false;
+    }
+  }
   diagSetStage("ha_net");
-  pageEngineLoopNetwork();
+  if (netHeapOkForHa()) pageEngineLoopNetwork();
   diagSetStage("ntp");
   timeSyncLoop();
   bleTaskLoop();

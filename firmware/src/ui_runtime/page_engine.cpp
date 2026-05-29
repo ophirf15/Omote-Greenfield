@@ -10,11 +10,16 @@
 #include <NimBLEDevice.h>
 #include "net/http_server.h"
 #include "net/ha_client.h"
+#include "net/ha_state_store.h"
+#include "net/ha_async_worker.h"
+#include "net/ha_websocket.h"
 #include "hal/ha_icon_hal.h"
 #include "net/net_worker.h"
+#include "net/net_heap.h"
 #include "net/runtime_diag.h"
 #include "net/time_sync.h"
 #include "hal/pins.h"
+#include "hal/power_btn_hal.h"
 #include <ArduinoJson.h>
 #include <math.h>
 #include <string.h>
@@ -33,7 +38,13 @@ static lv_obj_t *gContent = nullptr;
 static lv_obj_t *gSettingsPanel = nullptr;
 static std::vector<lv_obj_t *> gWidgets;
 static String gCachedPageId;
-static std::vector<ButtonDef> gCachedButtons;
+/** Pointer into gCfg->pages — no vector copy (copy threw std::bad_alloc on swipe under low heap). */
+static const PageDef *gCachedPage = nullptr;
+
+static inline size_t cachedButtonCount() {
+  return gCachedPage ? gCachedPage->buttons.size() : 0;
+}
+static inline const ButtonDef &cachedButton(size_t i) { return gCachedPage->buttons[i]; }
 static lv_obj_t *gOverlayMsg = nullptr;
 static bool gShowingSettings = false;
 static bool gShowingKeyboard = false;
@@ -45,6 +56,9 @@ static bool gKbShift = false;
 static uint32_t sLastHaPoll = 0;
 static uint32_t sHaPollNotBeforeMs = 0;
 static uint32_t sPageEngineBootMs = 0;
+static bool sNetworkServicesReady = false;
+static bool sPendingHaSubscribe = false;
+static uint32_t sLastBootstrapMs = 0;
 static constexpr uint32_t kHaBootGraceMs = 25000;
 static constexpr uint32_t kHaPollIntervalMs = 8000;
 static constexpr uint32_t kEntityOptimisticMs = 8000;
@@ -68,10 +82,14 @@ struct HaUiJob {
   bool wantOn = false;
 };
 static HaUiJob sHaUiJob;
+static HaUiJob sHaUiAsyncJob;
+static bool sHaUiAsyncInFlight = false;
+static bool sClimateAsyncCall = false;
+static bool sClimateFetchPending = false;
+static std::vector<String> sLastHaEntityIds;
+static uint32_t sLastHaSubscribeMs = 0;
 static bool sHaSyncInProgress = false;
 static volatile bool sReloadPending = false;
-static size_t sSkipToggleSyncIdx = SIZE_MAX;
-static uint32_t sSkipToggleSyncUntil = 0;
 struct ToggleUi {
   lv_obj_t *sw = nullptr;
   size_t btnIndex = 0;
@@ -109,64 +127,13 @@ static std::vector<HaLabelUi> gHaLabels;
 static std::vector<HaClimateUi> gHaClimates;
 static ClimateThermostatUi gThermostat;
 
-struct EntityStateCacheEntry {
-  String entityId;
-  bool isOn = false;
-  uint32_t optimisticUntil = 0;
-};
-static std::vector<EntityStateCacheEntry> sEntityStateCache;
-static constexpr size_t kEntityCacheMax = 28;
-
-static EntityStateCacheEntry *entityCacheFind(const String &entityId) {
-  if (entityId.length() == 0) return nullptr;
-  for (auto &e : sEntityStateCache) {
-    if (e.entityId == entityId) return &e;
-  }
-  return nullptr;
-}
-
-static bool entityCacheGet(const String &entityId, bool &isOn) {
-  const EntityStateCacheEntry *e = entityCacheFind(entityId);
-  if (!e) return false;
-  isOn = e->isOn;
-  return true;
-}
-
-static void entityCachePut(const String &entityId, bool isOn) {
-  if (entityId.length() == 0) return;
-  if (EntityStateCacheEntry *e = entityCacheFind(entityId)) {
-    e->isOn = isOn;
-    return;
-  }
-  if (sEntityStateCache.size() >= kEntityCacheMax) {
-    sEntityStateCache.erase(sEntityStateCache.begin());
-  }
-  EntityStateCacheEntry ent;
-  ent.entityId = entityId;
-  ent.isOn = isOn;
-  sEntityStateCache.push_back(ent);
-}
-
-static void entityCacheMarkOptimistic(const String &entityId, bool isOn) {
-  if (entityId.length() == 0) return;
-  entityCachePut(entityId, isOn);
-  if (EntityStateCacheEntry *e = entityCacheFind(entityId)) {
-    const uint32_t until = millis() + kEntityOptimisticMs;
-    if (until > e->optimisticUntil) e->optimisticUntil = until;
-  }
-}
-
-static bool entityCacheIsOptimistic(const String &entityId) {
-  const EntityStateCacheEntry *e = entityCacheFind(entityId);
-  return e && millis() < e->optimisticUntil;
-}
-
 static lv_color_t hexToColor(uint32_t hex) { return lv_color_hex(hex & 0xFFFFFF); }
 static void stripContainerStyle(lv_obj_t *obj);
 static void cyclePage(int dir);
 static void updateStatusBarTitle();
 static void buildPageWidgets();
 static void pageEngineSwitchPageLight();
+static void setSwitchChecked(lv_obj_t *sw, bool on, bool sendEvents);
 static void makeTransparentContainer(lv_obj_t *obj) {
   stripContainerStyle(obj);
   lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, 0);
@@ -378,12 +345,142 @@ static String climateEntityForButton(const ButtonDef &btn) {
   return String();
 }
 
+static void collectPageEntityIds(std::vector<String> &out) {
+  out.clear();
+  if (!gCachedPage) return;
+  for (const auto &btn : gCachedPage->buttons) {
+    if (btn.action.entityId.length() == 0) continue;
+    bool dup = false;
+    for (const auto &e : out) {
+      if (e == btn.action.entityId) dup = true;
+    }
+    if (!dup) out.push_back(btn.action.entityId);
+  }
+  if (gThermostat.panel && gThermostat.btnIndex < cachedButtonCount()) {
+    const String ent = climateEntityForButton(cachedButton(gThermostat.btnIndex));
+    if (ent.length()) {
+      bool dup = false;
+      for (const auto &e : out) {
+        if (e == ent) dup = true;
+      }
+      if (!dup) out.push_back(ent);
+    }
+  }
+}
+
+static bool entityListsEqual(const std::vector<String> &a, const std::vector<String> &b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
+static void haSubscribeCurrentPage() {
+  if (!gHaSettings || !gHaSettings->configured || !wifiIsConnected()) return;
+  if (!sNetworkServicesReady) {
+    sPendingHaSubscribe = true;
+    return;
+  }
+  if (!netHeapOkForHa()) {
+    sPendingHaSubscribe = true;
+    return;
+  }
+  if (netWorkerWebUiActive(3000)) {
+    sPendingHaSubscribe = true;
+    return;
+  }
+  std::vector<String> ids;
+  collectPageEntityIds(ids);
+  if (ids.empty()) {
+    sPendingHaSubscribe = false;
+    return;
+  }
+  const uint32_t now = millis();
+  if (entityListsEqual(ids, sLastHaEntityIds) && now - sLastHaSubscribeMs < 15000) {
+    sPendingHaSubscribe = false;
+    return;
+  }
+  sPendingHaSubscribe = false;
+  sLastHaEntityIds = ids;
+  sLastHaSubscribeMs = now;
+  Serial.printf("ha: subscribe %u entities (heap=%u)\n", (unsigned)ids.size(), ESP.getFreeHeap());
+  haWsSubscribeEntities(ids);
+}
+
+void pageEngineNotifyNetworkReady() {
+  sNetworkServicesReady = true;
+  sPendingHaSubscribe = true;
+}
+
+static void pageEngineApplyHaStore() {
+  for (const auto &t : gToggles) {
+    if (t.btnIndex >= cachedButtonCount() || !t.sw) continue;
+    const ButtonDef &btn = cachedButton(t.btnIndex);
+    if (btn.action.entityId.length() == 0) continue;
+    bool on = false;
+    if (haStateStoreGetIsOn(btn.action.entityId, on)) setSwitchChecked(t.sw, on, false);
+  }
+  for (const auto &h : gHaLabels) {
+    if (h.btnIndex >= cachedButtonCount() || !h.valueLbl) continue;
+    const ButtonDef &btn = cachedButton(h.btnIndex);
+    if (btn.action.entityId.length() == 0) continue;
+    String state;
+    if (haStateStoreGetStateText(btn.action.entityId, state)) {
+      if (state.length() > 28) state = state.substring(0, 26) + "..";
+      lv_label_set_text(h.valueLbl, state.c_str());
+    }
+  }
+  displayRequestRefresh();
+}
+
 static void climateShowStatus(const char *msg) {
   if (gThermostat.modeLbl) lv_label_set_text(gThermostat.modeLbl, msg);
 }
 
-static bool syncClimateThermostat() {
-  if (!gThermostat.panel || gThermostat.btnIndex >= gCachedButtons.size() || !gHaSettings) return false;
+static void scheduleClimateResync(uint32_t delayMs);
+
+static bool climateAttrsForIdx(size_t idx, ClimateAttrs &ca) {
+  if (idx >= cachedButtonCount()) return false;
+  const String entityId = climateEntityForButton(cachedButton(idx));
+  if (!climateCacheGet(entityId, ca)) {
+    climateShowStatus("Syncing");
+    scheduleClimateResync(0);
+    return false;
+  }
+  return true;
+}
+
+static bool haQueueClimateService(const ActionDef &act) {
+  if (!gHaSettings || !gHaSettings->configured || !wifiIsConnected()) {
+    climateShowStatus("No HA");
+    return false;
+  }
+  haStateStoreAbortBootstrap();
+  if (!netHeapOkForHaPost()) {
+    Serial.printf("climate: low heap free=%u max=%u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    climateShowStatus("Low mem");
+    return false;
+  }
+  if (haAsyncBusy()) {
+    climateShowStatus("Busy");
+    return false;
+  }
+  String dom = act.domain;
+  String svc = act.service.length() ? act.service : "set_temperature";
+  haResolveHaCall(dom, svc, act.entityId);
+  if (!haAsyncStartCallService(*gHaSettings, dom, svc, act.entityId, act.dataJson)) {
+    climateShowStatus("Busy");
+    return false;
+  }
+  sClimateAsyncCall = true;
+  climateShowStatus("Sending");
+  sleepNotifyActivity();
+  return true;
+}
+
+static bool syncClimateThermostatAsync() {
+  if (!gThermostat.panel || gThermostat.btnIndex >= cachedButtonCount() || !gHaSettings) return false;
   if (!gHaSettings->configured) {
     climateShowStatus("HA not set");
     return false;
@@ -392,37 +489,29 @@ static bool syncClimateThermostat() {
     climateShowStatus("No WiFi");
     return false;
   }
-  const ButtonDef &btn = gCachedButtons[gThermostat.btnIndex];
+  if (haAsyncBusy() || sClimateFetchPending) return false;
+  const ButtonDef &btn = cachedButton(gThermostat.btnIndex);
   const String entityId = climateEntityForButton(btn);
   if (entityId.length() == 0) {
     climateShowStatus("No entity");
     return false;
   }
-  String raw, err;
-  netWorkerSetPreferShortTimeout(true);
-  const bool ok = haFetchEntityRaw(*gHaSettings, entityId, raw, err);
-  netWorkerSetPreferShortTimeout(false);
-  if (ok) {
-    ClimateAttrs ca;
-    if (parseClimateAttrs(raw, ca)) {
-      climateCachePut(entityId, ca);
-      applyClimateAttrsToUi(ca);
-      sClimateLastOkMs = millis();
-      return true;
-    }
-    Serial.printf("climate: attrs parse failed %s\n", entityId.c_str());
-    climateShowStatus("Parse err");
-  } else {
-    Serial.printf("climate: fetch %s failed: %s\n", entityId.c_str(), err.c_str());
+  haStateStoreAbortBootstrap();
+  if (!netHeapOkForHaGet()) {
     ClimateAttrs ca;
     if (climateCacheGet(entityId, ca)) {
       applyClimateAttrsToUi(ca);
       climateShowStatus("Cached");
+      sClimateLastOkMs = millis();
       return true;
     }
-    climateShowStatus("HA err");
+    climateShowStatus("Low mem");
+    return false;
   }
-  return false;
+  if (!haAsyncStartFetchClimateRaw(*gHaSettings, entityId)) return false;
+  sClimateFetchPending = true;
+  climateShowStatus("Syncing");
+  return true;
 }
 
 static void scheduleClimateResync(uint32_t delayMs) {
@@ -597,8 +686,19 @@ static void buildClimateThermostat(const ButtonDef &btn, size_t idx) {
   }
 }
 static void haCallClimateTemp(size_t btnIndex, float target) {
-  if (!gExec || btnIndex >= gCachedButtons.size() || !gHaSettings) return;
-  const ButtonDef &btn = gCachedButtons[btnIndex];
+  if (btnIndex >= cachedButtonCount() || !gHaSettings) return;
+  const ButtonDef &btn = cachedButton(btnIndex);
+  const String entityId = climateEntityForButton(btn);
+  ClimateAttrs ca;
+  if (climateCacheGet(entityId, ca)) {
+    ca.target = target;
+    if (!ca.hasRange) {
+      ca.low = target;
+      ca.high = target;
+    }
+    climateCachePut(entityId, ca);
+    applyClimateAttrsToUi(ca);
+  }
   ActionDef act = btn.action;
   act.type = ACTION_HA_SERVICE;
   act.domain = "climate";
@@ -606,12 +706,20 @@ static void haCallClimateTemp(size_t btnIndex, float target) {
   JsonDocument dj;
   dj["temperature"] = target;
   serializeJson(dj, act.dataJson);
-  gExec->execute(act);
-  sClimateResyncPending = true;
+  if (haQueueClimateService(act)) scheduleClimateResync(6000);
 }
 static void haCallClimateRange(size_t btnIndex, float low, float high) {
-  if (!gExec || btnIndex >= gCachedButtons.size() || !gHaSettings) return;
-  const ButtonDef &btn = gCachedButtons[btnIndex];
+  if (btnIndex >= cachedButtonCount() || !gHaSettings) return;
+  const ButtonDef &btn = cachedButton(btnIndex);
+  const String entityId = climateEntityForButton(btn);
+  ClimateAttrs ca;
+  if (climateCacheGet(entityId, ca)) {
+    ca.low = low;
+    ca.high = high;
+    ca.hasRange = true;
+    climateCachePut(entityId, ca);
+    applyClimateAttrsToUi(ca);
+  }
   ActionDef act = btn.action;
   act.type = ACTION_HA_SERVICE;
   act.domain = "climate";
@@ -620,12 +728,18 @@ static void haCallClimateRange(size_t btnIndex, float low, float high) {
   dj["target_temp_low"] = low;
   dj["target_temp_high"] = high;
   serializeJson(dj, act.dataJson);
-  gExec->execute(act);
-  sClimateResyncPending = true;
+  if (haQueueClimateService(act)) scheduleClimateResync(6000);
 }
 static void haCallClimateMode(size_t btnIndex, const char *mode) {
-  if (!gExec || btnIndex >= gCachedButtons.size() || !gHaSettings) return;
-  const ButtonDef &btn = gCachedButtons[btnIndex];
+  if (btnIndex >= cachedButtonCount() || !gHaSettings) return;
+  const ButtonDef &btn = cachedButton(btnIndex);
+  const String entityId = climateEntityForButton(btn);
+  ClimateAttrs ca;
+  if (climateCacheGet(entityId, ca)) {
+    ca.mode = mode;
+    climateCachePut(entityId, ca);
+    applyClimateAttrsToUi(ca);
+  }
   ActionDef act = btn.action;
   act.type = ACTION_HA_SERVICE;
   act.domain = "climate";
@@ -633,22 +747,16 @@ static void haCallClimateMode(size_t btnIndex, const char *mode) {
   JsonDocument dj;
   dj["hvac_mode"] = mode;
   serializeJson(dj, act.dataJson);
-  gExec->execute(act);
-  sClimateResyncPending = true;
+  if (haQueueClimateService(act)) scheduleClimateResync(6000);
 }
 static void onThermoAdjustBtn(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   const intptr_t packed = (intptr_t)lv_event_get_user_data(e);
   const size_t idx = (size_t)(packed >> 2);
   const int which = (int)(packed & 3);  // 0 heat-, 1 heat+, 2 cool-, 3 cool+
-  if (idx >= gCachedButtons.size()) return;
-  String raw, err;
-  netWorkerSetPreferShortTimeout(true);
-  const bool got = haFetchEntityRaw(*gHaSettings, gCachedButtons[idx].action.entityId, raw, err);
-  netWorkerSetPreferShortTimeout(false);
-  if (!got) return;
+  if (idx >= cachedButtonCount()) return;
   ClimateAttrs ca;
-  if (!parseClimateAttrs(raw, ca)) return;
+  if (!climateAttrsForIdx(idx, ca)) return;
   if (ca.hasRange) {
     float low = ca.low;
     float high = ca.high;
@@ -663,7 +771,7 @@ static void onThermoAdjustBtn(lv_event_t *e) {
     haCallClimateRange(idx, low, high);
     return;
   }
-  float t = ca.target > 0 ? ca.target : readClimateTempNative(raw);
+  float t = ca.target > 0 ? ca.target : ca.current;
   if (t < ca.minT) t = ca.minT;
   if (which == 0 || which == 2) t -= 1.0f;
   else t += 1.0f;
@@ -676,15 +784,10 @@ static void onClimateTempBtn(lv_event_t *e) {
   const intptr_t packed = (intptr_t)lv_event_get_user_data(e);
   const size_t idx = (size_t)(packed >> 1);
   const int delta = (packed & 1) ? 1 : -1;
-  if (idx >= gCachedButtons.size()) return;
-  String raw, err;
-  netWorkerSetPreferShortTimeout(true);
-  const bool got = haFetchEntityRaw(*gHaSettings, gCachedButtons[idx].action.entityId, raw, err);
-  netWorkerSetPreferShortTimeout(false);
-  if (!got) return;
+  if (idx >= cachedButtonCount()) return;
   ClimateAttrs ca;
-  if (!parseClimateAttrs(raw, ca)) return;
-  float t = ca.target > 0 ? ca.target : readClimateTempNative(raw);
+  if (!climateAttrsForIdx(idx, ca)) return;
+  float t = ca.target > 0 ? ca.target : ca.current;
   if (t < ca.minT) t = ca.minT + 1.0f;
   t += (float)delta;
   if (t < ca.minT) t = ca.minT;
@@ -745,70 +848,13 @@ static void markUiBusy(uint32_t durationMs) {
 
 static void pageEngineReloadDone() {
   sHaSyncCursor = 0;
-  scheduleHaPollAfter(1500);
+  if (sNetworkServicesReady) haSubscribeCurrentPage();
+  else sPendingHaSubscribe = true;
   displayRequestRefresh();
   diagSetStage("ui_loop");
 }
 
-static void pageEngineSyncHaBatch(int maxItems) {
-  if (!gHaSettings || !gHaSettings->configured || !wifiIsConnected() || gShowingSettings) return;
-  if (ESP.getFreeHeap() < 18000) return;
-  /* Climate state is fetched only when sClimateResyncPending — not every poll tick. */
-  if (gThermostat.panel) return;
-  const size_t nT = gToggles.size();
-  const size_t nL = gHaLabels.size();
-  const size_t nC = gHaClimates.size();
-  const size_t total = nT + nL + nC;
-  if (total == 0) return;
-
-  for (int n = 0; n < maxItems; n++) {
-    const size_t pass = sHaSyncCursor % total;
-    sHaSyncCursor = (sHaSyncCursor + 1) % total;
-    if (pass < nT) {
-      const auto &t = gToggles[pass];
-      if (t.btnIndex >= gCachedButtons.size() || !t.sw) continue;
-      if (t.btnIndex == sSkipToggleSyncIdx && millis() < sSkipToggleSyncUntil) continue;
-      const ButtonDef &btn = gCachedButtons[t.btnIndex];
-      if (btn.action.entityId.length() == 0) continue;
-      if (entityCacheIsOptimistic(btn.action.entityId)) continue;
-      String state, err;
-      if (!haFetchEntityState(*gHaSettings, btn.action.entityId, state, err)) continue;
-      if (state == "unavailable" || state == "unknown") continue;
-      const bool on = haStateIsOn(state);
-      entityCachePut(btn.action.entityId, on);
-      setSwitchChecked(t.sw, on, false);
-    } else if (pass < nT + nL) {
-      const auto &h = gHaLabels[pass - nT];
-      if (h.btnIndex >= gCachedButtons.size() || !h.valueLbl) continue;
-      const ButtonDef &btn = gCachedButtons[h.btnIndex];
-      if (btn.action.entityId.length() == 0) continue;
-      String state, err;
-      if (!haFetchEntityState(*gHaSettings, btn.action.entityId, state, err)) continue;
-      if (state.length() > 28) state = state.substring(0, 26) + "..";
-      lv_label_set_text(h.valueLbl, state.c_str());
-    } else {
-      const auto &c = gHaClimates[pass - nT - nL];
-      if (c.btnIndex >= gCachedButtons.size()) continue;
-      const ButtonDef &btn = gCachedButtons[c.btnIndex];
-      if (btn.action.entityId.length() == 0) continue;
-      String raw, err;
-      if (!haFetchEntityRaw(*gHaSettings, btn.action.entityId, raw, err)) continue;
-      static JsonDocument doc;
-      doc.clear();
-      if (deserializeJson(doc, raw)) continue;
-      float t = readClimateTempNative(raw);
-      String mode = doc["attributes"]["hvac_mode"] | doc["state"].as<String>();
-      if (c.tempLbl) {
-        char buf[24];
-        snprintf(buf, sizeof(buf), "%.0f°", t);
-        lv_label_set_text(c.tempLbl, buf);
-      }
-      if (c.modeLbl) lv_label_set_text(c.modeLbl, mode.c_str());
-    }
-  }
-}
-
-void pageEngineSyncHaToggles() { pageEngineSyncHaBatch(1); }
+void pageEngineSyncHaToggles() { pageEngineApplyHaStore(); }
 void pageEngineOnSwipeDrag(int dx, int dy) {
   if (gShowingSettings || gShowingKeyboard) return;
   if (dy > 55 && abs(dy) > abs(dx) * 2) {
@@ -875,51 +921,138 @@ static void applyToggleHaService(ActionDef &act, bool wantOn) {
   act.domain = dom;
 }
 
+static void finishHaToggleJob(const HaUiJob &job, bool ok) {
+  if (!job.isToggle || job.btnIndex >= cachedButtonCount()) return;
+  const ButtonDef &btn = cachedButton(job.btnIndex);
+  Serial.printf("HA %s %s: %s\n", job.action.service.c_str(), btn.action.entityId.c_str(),
+                ok ? "ok" : "fail");
+  lv_obj_t *sw = nullptr;
+  for (const auto &t : gToggles) {
+    if (t.btnIndex == job.btnIndex) {
+      sw = t.sw;
+      break;
+    }
+  }
+  if (ok) {
+    haStateStoreMarkOptimistic(btn.action.entityId, job.wantOn, kEntityOptimisticMs);
+    if (sw) setSwitchChecked(sw, job.wantOn, false);
+  } else if (sw) {
+    haStateStoreMarkOptimistic(btn.action.entityId, !job.wantOn, 500);
+    setSwitchChecked(sw, !job.wantOn, false);
+  }
+}
+
+static void pageEnginePollHaAsync() {
+  HaAsyncKind kind = HaAsyncKind::None;
+  bool ok = false;
+  String entityId;
+  String extra;
+  if (!haAsyncPoll(kind, ok, entityId, extra)) return;
+
+  if (kind == HaAsyncKind::FetchState) {
+    if (ok) haStateStoreUpdate(entityId, extra);
+    pageEngineApplyHaStore();
+    return;
+  }
+
+  if (kind == HaAsyncKind::FetchClimateRaw) {
+    sClimateFetchPending = false;
+    if (ok) {
+      ClimateAttrs ca;
+      if (parseClimateAttrs(extra, ca)) {
+        climateCachePut(entityId, ca);
+        applyClimateAttrsToUi(ca);
+        sClimateLastOkMs = millis();
+        sClimateResyncPending = false;
+      } else {
+        climateShowStatus("Parse err");
+      }
+    } else {
+      ClimateAttrs ca;
+      if (climateCacheGet(entityId, ca)) {
+        applyClimateAttrsToUi(ca);
+        climateShowStatus("Cached");
+      } else {
+        climateShowStatus("HA err");
+      }
+    }
+    displayRequestRefresh();
+    return;
+  }
+
+  if (kind != HaAsyncKind::CallService) return;
+
+  if (sClimateAsyncCall) {
+    sClimateAsyncCall = false;
+    Serial.printf("climate: %s %s\n", ok ? "ok" : "fail", entityId.c_str());
+    if (ok) {
+      scheduleClimateResync(8000);
+    } else {
+      climateShowStatus("HA err");
+    }
+    displayRequestRefresh();
+    sleepNotifyActivity();
+    return;
+  }
+
+  if (!sHaUiAsyncInFlight) return;
+  sHaUiAsyncInFlight = false;
+  diagSetTogglePending(false);
+  const HaUiJob job = sHaUiAsyncJob;
+  String prevPage = gExec ? gExec->activePageId() : "";
+  if (job.isToggle) {
+    finishHaToggleJob(job, ok);
+  } else if (ok && gExec && gExec->activePageId() != prevPage) {
+    pageEngineAfterAction(true);
+  }
+  sHaUiQuietUntil = millis() + 500;
+  displayRequestRefresh();
+  sleepNotifyActivity();
+}
+
 static void processHaUiJob() {
   if (!sHaUiJob.pending) return;
-  if (millis() < sUiBusyUntilMs) return;
+  if (millis() < sUiBusyUntilMs && !sHaUiJob.isToggle) return;
+  if (haAsyncBusy()) return;
 
   HaUiJob job = sHaUiJob;
   sHaUiJob.pending = false;
-  diagSetTogglePending(false);
 
   if (job.isToggle) applyToggleHaService(job.action, job.wantOn);
 
-  netWorkerSetPreferShortTimeout(true);
   diagSetStage("ha_ui");
 
   String prevPage = gExec ? gExec->activePageId() : "";
-  bool ok = gExec ? gExec->execute(job.action) : false;
+  bool ok = false;
 
-  netWorkerSetPreferShortTimeout(false);
+  if (job.action.type == ACTION_HA_SERVICE && gHaSettings && gHaSettings->configured) {
+    sHaUiAsyncJob = job;
+    if (haAsyncStartCallService(*gHaSettings, job.action.domain, job.action.service,
+                                job.action.entityId, job.action.dataJson)) {
+      sHaUiAsyncInFlight = true;
+      diagSetStage("ui_loop");
+      return;
+    }
+    String err;
+    ok = haWsCallService(job.action.domain, job.action.service, job.action.entityId,
+                         job.action.dataJson, err);
+    if (!ok && gExec) {
+      netWorkerSetPreferShortTimeout(true);
+      ok = gExec->execute(job.action);
+      netWorkerSetPreferShortTimeout(false);
+    }
+  } else if (gExec) {
+    ok = gExec->execute(job.action);
+  }
 
-  if (job.isToggle && job.btnIndex < gCachedButtons.size()) {
-    const ButtonDef &btn = gCachedButtons[job.btnIndex];
-    Serial.printf("HA %s %s: %s\n", job.action.service.c_str(), btn.action.entityId.c_str(),
-                  ok ? "ok" : "fail");
-    lv_obj_t *sw = nullptr;
-    for (const auto &t : gToggles) {
-      if (t.btnIndex == job.btnIndex) {
-        sw = t.sw;
-        break;
-      }
-    }
-    if (ok) {
-      sSkipToggleSyncIdx = job.btnIndex;
-      sSkipToggleSyncUntil = millis() + kEntityOptimisticMs;
-      entityCacheMarkOptimistic(btn.action.entityId, job.wantOn);
-      if (sw) setSwitchChecked(sw, job.wantOn, false);
-    } else if (sw) {
-      entityCachePut(btn.action.entityId, !job.wantOn);
-      if (EntityStateCacheEntry *ent = entityCacheFind(btn.action.entityId)) ent->optimisticUntil = 0;
-      setSwitchChecked(sw, !job.wantOn, false);
-    }
+  diagSetTogglePending(false);
+  if (job.isToggle) {
+    finishHaToggleJob(job, ok);
   } else if (ok && gExec && gExec->activePageId() != prevPage) {
     pageEngineAfterAction(true);
   }
 
-  sHaUiQuietUntil = millis() + 1500;
-  scheduleHaPollAfter(kEntityOptimisticMs);
+  sHaUiQuietUntil = millis() + 500;
   diagSetStage("ui_loop");
   displayRequestRefresh();
   sleepNotifyActivity();
@@ -927,8 +1060,8 @@ static void processHaUiJob() {
 static void onBtnEvent(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
   size_t idx = (size_t)lv_event_get_user_data(e);
-  if (!gExec || idx >= gCachedButtons.size()) return;
-  const ButtonDef &btn = gCachedButtons[idx];
+  if (!gExec || idx >= cachedButtonCount()) return;
+  const ButtonDef &btn = cachedButton(idx);
   lv_obj_t *target = lv_event_get_target(e);
   if (btn.widget == WIDGET_MOMENTARY) {
     if (code == LV_EVENT_PRESSED) {
@@ -957,14 +1090,14 @@ static void onToggleChanged(lv_event_t *e) {
   if (sHaSyncInProgress) return;
   diagLvglEventEnter("toggle");
   const size_t idx = (size_t)lv_event_get_user_data(e);
-  if (idx >= gCachedButtons.size()) {
+  if (idx >= cachedButtonCount()) {
     diagLvglEventLeave();
     return;
   }
   lv_obj_t *sw = lv_event_get_target(e);
-  const ButtonDef &btn = gCachedButtons[idx];
+  const ButtonDef &btn = cachedButton(idx);
   const bool wantOn = sw && lv_obj_has_state(sw, LV_STATE_CHECKED);
-  if (btn.action.entityId.length()) entityCacheMarkOptimistic(btn.action.entityId, wantOn);
+  if (btn.action.entityId.length()) haStateStoreMarkOptimistic(btn.action.entityId, wantOn, kEntityOptimisticMs);
   sHaUiJob.action = btn.action;
   sHaUiJob.btnIndex = idx;
   sHaUiJob.isToggle = true;
@@ -986,7 +1119,7 @@ static void clearWidgets() {
   gHaClimates.clear();
   gThermostat = ClimateThermostatUi{};
   haIconClearAll();
-  gCachedButtons.clear();
+  gCachedPage = nullptr;
   if (gOverlayMsg) {
     lv_obj_del(gOverlayMsg);
     gOverlayMsg = nullptr;
@@ -1319,7 +1452,10 @@ static void buildSettingsPanel() {
   lv_obj_add_event_cb(btnReboot, [](lv_event_t *) { ESP.restart(); }, LV_EVENT_CLICKED, nullptr);
 }
 void pageEngineSetDeviceSettings(DeviceSettings *ds) { gDevSettings = ds; }
-void pageEngineSetHaSettings(HaSettings *ha) { gHaSettings = ha; }
+void pageEngineSetHaSettings(HaSettings *ha) {
+  gHaSettings = ha;
+  haWsSetSettings(ha);
+}
 void pageEngineInit(OmoteConfig *config, ActionExecutor *executor) {
   gCfg = config;
   gExec = executor;
@@ -1409,11 +1545,11 @@ void pageEngineReload() {
     return;
   }
   gCachedPageId = pageId;
-  gCachedButtons = page->buttons;
+  gCachedPage = page;
   sHaSyncCursor = 0;
-  for (size_t ti = 0; ti < gCachedButtons.size(); ti++) {
-    if (gCachedButtons[ti].widget == WIDGET_CLIMATE_THERMOSTAT) {
-      buildClimateThermostat(gCachedButtons[ti], ti);
+  for (size_t ti = 0; ti < cachedButtonCount(); ti++) {
+    if (cachedButton(ti).widget == WIDGET_CLIMATE_THERMOSTAT) {
+      buildClimateThermostat(cachedButton(ti), ti);
       scheduleClimateResync(400);
       pageEngineReloadDone();
       return;
@@ -1445,24 +1581,30 @@ static void pageEngineSwitchPageLight() {
     return;
   }
   gCachedPageId = gExec->activePageId();
-  gCachedButtons = page->buttons;
+  gCachedPage = page;
   sHaSyncCursor = 0;
 
-  for (size_t ti = 0; ti < gCachedButtons.size(); ti++) {
-    if (gCachedButtons[ti].widget == WIDGET_CLIMATE_THERMOSTAT) {
-      buildClimateThermostat(gCachedButtons[ti], ti);
+  for (size_t ti = 0; ti < cachedButtonCount(); ti++) {
+    if (cachedButton(ti).widget == WIDGET_CLIMATE_THERMOSTAT) {
+      buildClimateThermostat(cachedButton(ti), ti);
       scheduleClimateResync(kUiBusyAfterSwipeMs);
       diagSetStage("ui_loop");
       return;
     }
   }
   buildPageWidgets();
+  if (netHeapComfortable()) {
+    haSubscribeCurrentPage();
+    pageEngineApplyHaStore();
+  } else {
+    sPendingHaSubscribe = true;
+  }
   diagSetStage("ui_loop");
 }
 
 static void buildPageWidgets() {
-  for (size_t i = 0; i < gCachedButtons.size(); i++) {
-    const auto &btn = gCachedButtons[i];
+  for (size_t i = 0; i < cachedButtonCount(); i++) {
+    const auto &btn = cachedButton(i);
     lv_obj_t *w = nullptr;
     if (btn.widget == WIDGET_TOGGLE) {
       lv_obj_t *row = lv_obj_create(gContent);
@@ -1487,7 +1629,7 @@ static void buildPageWidgets() {
       }
       lv_obj_add_event_cb(w, onToggleChanged, LV_EVENT_VALUE_CHANGED, (void *)i);
       bool cachedOn = false;
-      if (btn.action.entityId.length() && entityCacheGet(btn.action.entityId, cachedOn)) {
+      if (btn.action.entityId.length() && haStateStoreGetIsOn(btn.action.entityId, cachedOn)) {
         setSwitchChecked(w, cachedOn, false);
       }
       gWidgets.push_back(row);
@@ -1660,23 +1802,41 @@ void pageEngineLoop() {
     }
   }
 
+  if (haStateStoreConsumeDirty()) pageEngineApplyHaStore();
+
   if (displayConsumeRefreshPending()) displayRefreshNow();
 }
 
 void pageEngineLoopNetwork() {
   if (displayIsOff()) return;
+  pageEnginePollHaAsync();
   if (diagHttpBusy()) return;
 
-  /* HVAC data: highest priority while thermostat is visible (retry until success). */
+  if (sPendingHaSubscribe && sNetworkServicesReady && netHeapOkForHa() &&
+      !netWorkerWebUiActive(2000)) {
+    haSubscribeCurrentPage();
+  }
+
+  if (!gThermostat.panel && gHaSettings && gHaSettings->configured && wifiIsConnected() &&
+      sNetworkServicesReady && netHeapOkForHaGet() && !netWorkerWebUiActive(8000) &&
+      millis() - sLastBootstrapMs >= 400) {
+    sLastBootstrapMs = millis();
+    if (haStateStoreBootstrapTick(*gHaSettings)) {
+      pageEngineApplyHaStore();
+      return;
+    }
+  } else if (gThermostat.panel && !netHeapComfortable()) {
+    haStateStoreAbortBootstrap();
+  }
+
+  /* HVAC: async fetch + no blocking HTTP on the UI thread. */
   if (climateNeedsService()) {
+    if (sClimateFetchPending || haAsyncBusy()) return;
+    if (netWorkerWebUiActive(5000)) return;
     const bool uiBusy = millis() < sUiBusyUntilMs;
     if (!uiBusy || sClimateLastOkMs == 0) {
       diagSetStage("ha_climate_sync");
-      if (syncClimateThermostat()) {
-        sClimateResyncPending = false;
-      } else {
-        scheduleClimateResync(kClimateRetryMs);
-      }
+      syncClimateThermostatAsync();
       displayRequestRefresh();
       diagSetStage("ui_loop");
       return;
@@ -1691,51 +1851,48 @@ void pageEngineLoopNetwork() {
     return;
   }
 
-  if (sHaUiJob.pending) {
+  if (sHaUiJob.pending && !sHaUiAsyncInFlight && !sClimateAsyncCall) {
     processHaUiJob();
     return;
   }
-
-  const uint32_t now = millis();
-  const bool haPollDue =
-      (now >= sHaPollNotBeforeMs) && (now - sPageEngineBootMs >= kHaBootGraceMs) &&
-      (sLastHaPoll == 0 || now - sLastHaPoll >= kHaPollIntervalMs);
-  if (gHaSettings && gHaSettings->configured && wifiIsConnected() && millis() >= sHaUiQuietUntil &&
-      haPollDue && (!gToggles.empty() || !gHaLabels.empty() || !gHaClimates.empty())) {
-    sLastHaPoll = now;
-    diagSetStage("ha_poll");
-    pageEngineSyncHaToggles();
-    displayRequestRefresh();
-    diagSetStage("ui_loop");
-  }
 }
-void pageEngineHandleKey(char key, bool pressed) {
-  if (!pressed || !gCfg || !gExec) return;
-  Serial.printf("KEY pressed: '%c' active_page=%s\n", key, gExec->activePageId().c_str());
-  sleepNotifyActivity();
-  String pageId = gExec->activePageId();
+static bool dispatchKeyAction(char key) {
+  if (!gCfg || !gExec) return false;
+  const String pageId = gExec->activePageId();
   const PageDef *page = configFindPage(*gCfg, pageId);
   if (page) {
     const ActionDef *act = pageFindKeyAction(*page, key);
     if (act) {
       Serial.printf("KEY action(page): '%c' type=%s\n", key, act->type.c_str());
-      String prev = gExec->activePageId();
+      const String prev = gExec->activePageId();
       gExec->execute(*act);
       pageEngineAfterAction(gExec->activePageId() != prev);
-      return;
+      return true;
     }
   }
   for (const auto &kb : gCfg->keymap) {
     if (kb.key == key && (kb.pageId.length() == 0 || kb.pageId == pageId)) {
       Serial.printf("KEY action(global): '%c' type=%s page_scope=%s\n", key, kb.action.type.c_str(),
                     kb.pageId.c_str());
-      String prev = gExec->activePageId();
+      const String prev = gExec->activePageId();
       gExec->execute(kb.action);
       pageEngineAfterAction(gExec->activePageId() != prev);
-      return;
+      return true;
     }
   }
+  return false;
+}
+
+void pageEngineHandleKey(char key, bool pressed) {
+  if (!pressed || !gCfg || !gExec) return;
+  Serial.printf("KEY pressed: '%c' active_page=%s\n", key, gExec->activePageId().c_str());
+  sleepNotifyActivity();
+  if (dispatchKeyAction(key)) return;
+  /* GPIO power is 'P'; matrix power is 'o' — try both for keymap entries. */
+  if (key == KEY_POWER && dispatchKeyAction('o')) return;
+  if (key == 'o' && dispatchKeyAction(KEY_POWER)) return;
   Serial.printf("KEY no action: '%c'\n", key);
+  const String pageId = gExec->activePageId();
   if (key == '1' && configFindPage(*gCfg, "home")) {
     gExec->setActivePage("home");
     saveActivePage();

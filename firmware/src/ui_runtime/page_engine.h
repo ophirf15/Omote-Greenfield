@@ -6,6 +6,8 @@
 
 void pageEngineSetDeviceSettings(DeviceSettings *ds);
 void pageEngineSetHaSettings(HaSettings *ha);
+/** Call once HTTP server is listening — defers HA subscribe/bootstrap until then. */
+void pageEngineNotifyNetworkReady();
 void pageEngineInit(OmoteConfig *config, ActionExecutor *executor);
 void pageEngineSyncHaToggles();
 void pageEngineOnSwipeDrag(int dx, int dy);

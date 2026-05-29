@@ -1,5 +1,6 @@
 #include "net/runtime_diag.h"
 #include "net/debug_log.h"
+#include "net/ha_websocket.h"
 #include <ArduinoJson.h>
 
 static const char *sStage = "boot";
@@ -87,6 +88,8 @@ String diagSnapshotJson() {
   if (sFlushPending) doc["flush_ms"] = now - sFlushSince;
   doc["toggle_pending"] = sTogglePending;
   doc["refresh_pending"] = sRefreshPending;
+  doc["ha_ws_connected"] = haWsIsConnected();
+  doc["ha_ws_connecting"] = haWsIsConnecting();
   doc["free_heap"] = ESP.getFreeHeap();
   doc["max_alloc_heap"] = ESP.getMaxAllocHeap();
   doc["min_free_heap"] = ESP.getMinFreeHeap();

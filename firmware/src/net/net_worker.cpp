@@ -1,4 +1,5 @@
 #include "net/net_worker.h"
+#include "net/net_heap.h"
 #include "net/runtime_diag.h"
 #include <HTTPClient.h>
 #include <WiFiClient.h>
@@ -47,7 +48,7 @@ static bool readCappedGetBody(HTTPClient &http, String &response) {
   response.reserve(2048);
   uint8_t buf[512];
   size_t total = 0;
-  const uint32_t deadline = millis() + 8000;
+  const uint32_t deadline = millis() + (sPreferShortTimeout ? 2800 : 8000);
   while ((http.connected() || stream->available()) && (int32_t)(millis() - deadline) < 0) {
     const int n = stream->readBytes(buf, sizeof(buf));
     if (n <= 0) {
@@ -93,6 +94,12 @@ DeviceMemInfo deviceMemSnapshot() {
 bool netWorkerHttpRequest(const HaSettings &s, const String &method, const String &path,
                           const String &body, int &httpCode, String &response) {
   if (!s.configured || !WiFi.isConnected()) return false;
+  const bool isPost = method == "POST";
+  if (isPost ? !netHeapOkForHaPost() : !netHeapOkForHaGet()) {
+    Serial.printf("net: low heap free=%u max=%u skip %s\n", ESP.getFreeHeap(),
+                  ESP.getMaxAllocHeap(), method.c_str());
+    return false;
+  }
   if (!gNetMutex) netWorkerInit();
 
   const uint32_t mutexMs = sPreferShortTimeout ? 1500 : 12000;

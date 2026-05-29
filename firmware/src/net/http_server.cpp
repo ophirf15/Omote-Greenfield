@@ -11,6 +11,7 @@
 #include "net/debug_log.h"
 #include "net/ha_client.h"
 #include "net/net_worker.h"
+#include "net/net_heap.h"
 #include "net/runtime_diag.h"
 #include "net/time_sync.h"
 #include "ui_runtime/page_engine.h"
@@ -32,9 +33,74 @@ static void httpCloseClient() {
   if (client && client.connected()) client.stop();
 }
 
+void httpServerDropClients() {
+  if (!gServerUp) return;
+  WiFiClient client = server.client();
+  if (client) client.stop();
+}
+
+/** Abort streaming on write failure — prevents infinite yield loops when TX buffers are full. */
+static bool httpClientWrite(WiFiClient &client, const uint8_t *data, size_t len) {
+  size_t sent = 0;
+  uint32_t stuckSince = millis();
+  const uint32_t deadline = millis() + 4000;
+  while (sent < len && (int32_t)(millis() - deadline) < 0) {
+    const size_t w = client.write(data + sent, len - sent);
+    if (w > 0) {
+      sent += w;
+      stuckSince = millis();
+      continue;
+    }
+    if (millis() - stuckSince > 150) return false;
+    yield();
+  }
+  return sent == len;
+}
+
+static bool httpClientWriteStr(WiFiClient &client, const char *s, size_t len = 0) {
+  if (!len) len = strlen(s);
+  return httpClientWrite(client, (const uint8_t *)s, len);
+}
+
+static bool httpStreamFile(WiFiClient &client, File &f, uint32_t maxMs = 8000) {
+  if (ESP.getFreeHeap() < 10000 && maxMs > 2500) maxMs = 2500;
+  const uint32_t deadline = millis() + maxMs;
+  uint8_t buf[512];
+  while (f.available() && (int32_t)(millis() - deadline) < 0) {
+    const size_t n = f.read(buf, sizeof(buf));
+    if (n == 0) break;
+    if (!httpClientWrite(client, buf, n)) {
+      Serial.println("http: stream aborted (client write failed)");
+      client.stop();
+      return false;
+    }
+  }
+  return true;
+}
+
+static uint32_t gRestartAtMs = 0;
+
+static void scheduleDeviceRestart(uint32_t delayMs = 450) {
+  gRestartAtMs = millis() + delayMs;
+}
+
+static void sendCorsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
+
+static void handleCorsPreflight() {
+  netWorkerTouchWebClient();
+  sendCorsHeaders();
+  server.sendHeader("Connection", "close");
+  server.send(204);
+  httpCloseClient();
+}
+
 static void sendJson(int code, const String &body) {
   netWorkerTouchWebClient();
-  server.sendHeader("Access-Control-Allow-Origin", "*");
+  sendCorsHeaders();
   server.sendHeader("Connection", "close");
   if (body.length() == 0) {
     server.send(code, "application/json", "{}");
@@ -79,6 +145,7 @@ static String mimeForPath(const String &path) {
 static void handleStatic() {
   netWorkerTouchWebClient();
   String path = server.uri();
+  if (path == "/editor" || path == "/editor/") path = "/editor/index.html";
   if (path == "/") path = "/index.html";
   if (!LittleFS.exists(path)) {
     if (path == "/index.html" && LittleFS.exists("/setup.html")) {
@@ -102,18 +169,10 @@ static void handleStatic() {
   server.sendHeader("Content-Type", mime);
   server.setContentLength(f.size());
   server.send(200);
-  uint8_t buf[1024];
   WiFiClient client = server.client();
-  while (f.available()) {
-    const size_t n = f.read(buf, sizeof(buf));
-    if (n == 0) break;
-    size_t sent = 0;
-    while (sent < n) {
-      const size_t w = client.write(buf + sent, n - sent);
-      if (w == 0) break;
-      sent += w;
-    }
-    yield();
+  if (!httpStreamFile(client, f)) {
+    f.close();
+    return;
   }
   f.close();
   httpCloseClient();
@@ -226,6 +285,10 @@ static void handleSettingsTest() {
  */
 static void handleBackupExport() {
   netWorkerTouchWebClient();
+  if (!netHeapComfortable()) {
+    sendJson(503, "{\"error\":\"low memory — close Web UI and retry\"}");
+    return;
+  }
 
   /* Small metadata header: omote_backup_version, exported_at, ha, wifi, device_settings.
    * config + ir_library are streamed verbatim from disk below. */
@@ -294,50 +357,52 @@ static void handleBackupExport() {
   server.send(200);
   WiFiClient client = server.client();
 
-  auto sendStr = [&](const char *s, size_t n) {
+  auto sendStr = [&](const char *s, size_t n) -> bool {
     if (!n) n = strlen(s);
-    size_t sent = 0;
-    while (sent < n) {
-      const size_t w = client.write((const uint8_t *)s + sent, n - sent);
-      if (w == 0) break;
-      sent += w;
-    }
+    return httpClientWriteStr(client, s, n);
   };
 
-  sendStr(headerJson.c_str(), headerJson.length());
+  if (!sendStr(headerJson.c_str(), headerJson.length())) {
+    httpCloseClient();
+    return;
+  }
 
   if (cfgSize > 0) {
-    sendStr(kCfgKey, sizeof(kCfgKey) - 1);
+    if (!sendStr(kCfgKey, sizeof(kCfgKey) - 1)) {
+      httpCloseClient();
+      return;
+    }
     File f = LittleFS.open(CONFIG_PATH, "r");
     if (f) {
-      uint8_t buf[512];
-      while (f.available()) {
-        const size_t n = f.read(buf, sizeof(buf));
-        if (n == 0) break;
-        sendStr((const char *)buf, n);
-        yield();
+      if (!httpStreamFile(client, f)) {
+        f.close();
+        return;
       }
       f.close();
     }
   }
 
-  sendStr(kIrKey, sizeof(kIrKey) - 1);
+  if (!sendStr(kIrKey, sizeof(kIrKey) - 1)) {
+    httpCloseClient();
+    return;
+  }
   if (irSize > 0) {
     File f = LittleFS.open(IRLIB_PATH, "r");
     if (f) {
-      uint8_t buf[512];
-      while (f.available()) {
-        const size_t n = f.read(buf, sizeof(buf));
-        if (n == 0) break;
-        sendStr((const char *)buf, n);
-        yield();
+      if (!httpStreamFile(client, f)) {
+        f.close();
+        return;
       }
       f.close();
     }
   } else {
-    sendStr(kEmptyArr, sizeof(kEmptyArr) - 1);
+    if (!sendStr(kEmptyArr, sizeof(kEmptyArr) - 1)) {
+      httpCloseClient();
+      return;
+    }
   }
   sendStr("}", 1);
+  httpCloseClient();
 }
 
 static void handleBackupImport() {
@@ -434,13 +499,10 @@ static void handleConfigGet() {
   server.sendHeader("Content-Type", "application/json");
   server.setContentLength(f.size());
   server.send(200);
-  uint8_t buf[512];
   WiFiClient client = server.client();
-  while (f.available()) {
-    const size_t n = f.read(buf, sizeof(buf));
-    if (n == 0) break;
-    client.write(buf, n);
-    yield();
+  if (!httpStreamFile(client, f)) {
+    f.close();
+    return;
   }
   f.close();
   httpCloseClient();
@@ -466,6 +528,11 @@ static void handleConfigPost() {
     sendJson(400, "{\"error\":\"empty body\"}");
     return;
   }
+  if (body.length() > 8192 &&
+      ESP.getMaxAllocHeap() < (size_t)body.length() + 4096) {
+    sendJson(503, "{\"error\":\"low memory — close omote.local tab and retry\"}");
+    return;
+  }
   gConfigDeployBusy = true;
   const DeviceMemInfo mem = deviceMemSnapshot();
   Serial.printf("deploy heap free=%u max=%u min=%u\n", mem.freeHeap, mem.maxAllocHeap,
@@ -477,11 +544,14 @@ static void handleConfigPost() {
     return;
   }
   sendJson(200, "{\"ok\":true,\"restart\":true}");
-  delay(250);
-  ESP.restart();
+  scheduleDeviceRestart();
 }
 
 static void handleHaEntities() {
+  if (!netHeapComfortable()) {
+    sendJson(503, "{\"error\":\"device busy — close Web UI tab\"}");
+    return;
+  }
   String domain = server.hasArg("domain") ? server.arg("domain") : "light";
   String search = server.hasArg("search") ? server.arg("search") : "";
   String json, err;
@@ -493,15 +563,14 @@ static void handleHaEntities() {
 }
 
 static void handleHaStates() {
-  String json, err;
-  if (!gSettings || !haFetchStates(*gSettings, json, err)) {
-    sendJson(400, String("{\"error\":\"") + err + "\"}");
-    return;
-  }
-  sendJson(200, json);
+  sendJson(503, "{\"error\":\"disabled on device — use HA from browser\"}");
 }
 
 static void handleHaEntityState() {
+  if (!netHeapComfortable()) {
+    sendJson(503, "{\"error\":\"device busy — close Web UI tab\"}");
+    return;
+  }
   if (!server.hasArg("entity_id")) {
     sendJson(400, "{\"error\":\"entity_id required\"}");
     return;
@@ -633,13 +702,18 @@ void httpServerBegin(HaSettings &settings, OmoteConfig &config, DeviceSettings &
   gOnChange = onConfigChanged;
 
   server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/api/status", HTTP_OPTIONS, handleCorsPreflight);
   server.on("/api/settings", HTTP_GET, handleSettingsGet);
   server.on("/api/settings", HTTP_POST, handleSettingsPost);
+  server.on("/api/settings", HTTP_OPTIONS, handleCorsPreflight);
   server.on("/api/settings/test", HTTP_POST, handleSettingsTest);
+  server.on("/api/settings/test", HTTP_OPTIONS, handleCorsPreflight);
   server.on("/api/backup/export", HTTP_GET, handleBackupExport);
   server.on("/api/backup/import", HTTP_POST, handleBackupImport);
+  server.on("/api/backup/import", HTTP_OPTIONS, handleCorsPreflight);
   server.on("/api/config", HTTP_GET, handleConfigGet);
   server.on("/api/config", HTTP_POST, handleConfigPost);
+  server.on("/api/config", HTTP_OPTIONS, handleCorsPreflight);
   server.on("/api/ha/entities", HTTP_GET, handleHaEntities);
   server.on("/api/ha/states", HTTP_GET, handleHaStates);
   server.on("/api/ha/entity", HTTP_GET, handleHaEntityState);
@@ -868,10 +942,7 @@ void httpServerBegin(HaSettings &settings, OmoteConfig &config, DeviceSettings &
 
   server.onNotFound([]() {
     if (server.method() == HTTP_OPTIONS) {
-      server.sendHeader("Access-Control-Allow-Origin", "*");
-      server.sendHeader("Connection", "close");
-      server.send(204, "text/plain", "");
-      httpCloseClient();
+      handleCorsPreflight();
       return;
     }
     if (server.uri().startsWith("/api/")) {
@@ -901,10 +972,38 @@ void httpServerBegin(HaSettings &settings, OmoteConfig &config, DeviceSettings &
 
 void httpServerLoop() {
   if (!gServerUp) return;
-  for (int i = 0; i < 8; i++) {
+
+  if (gRestartAtMs != 0 && (int32_t)(millis() - gRestartAtMs) >= 0) {
+    gRestartAtMs = 0;
+    httpServerDropClients();
+    delay(80);
+    ESP.restart();
+  }
+
+  if (ESP.getFreeHeap() < 4500) {
+    httpServerDropClients();
+    return;
+  }
+
+  WiFiClient client = server.client();
+  if (!netHeapOkForHaPost() && client && client.connected()) {
+    const String uri = server.uri();
+    if (uri == "/api/config" || uri == "/api/backup/export" || uri.startsWith("/editor/")) {
+      Serial.printf("http: drop heavy client free=%u max=%u uri=%s\n", ESP.getFreeHeap(),
+                    ESP.getMaxAllocHeap(), uri.c_str());
+      client.stop();
+      return;
+    }
+  }
+  const uint32_t budgetEnd = millis() + (netHeapComfortable() ? 18 : 8);
+  int passes = 0;
+  while ((int32_t)(millis() - budgetEnd) < 0 && passes < 2) {
     server.handleClient();
     yield();
+    passes++;
+    client = server.client();
+    if (!client || !client.connected()) break;
   }
-  WiFiClient client = server.client();
+  client = server.client();
   if (client && !client.connected()) client.stop();
 }

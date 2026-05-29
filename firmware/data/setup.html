@@ -39,15 +39,22 @@
   <p id="ble-msg" class="muted"></p>
   <hr />
   <h2>Layout editor</h2>
-  <p class="muted">Run from the Omote repo on your computer:</p>
-  <pre><code>cd tools/web-editor
-python -m http.server 8080</code></pre>
-  <p>Then open <a id="editor-link" href="http://localhost:8080" target="_blank">http://localhost:8080</a> and set device URL to <code id="device-url">http://omote.local</code>.</p>
-  <p><a href="/api/device/mem" target="_blank">Memory stats</a> · <a href="/api/config" target="_blank">Config JSON</a></p>
+  <p>Open the editor on this device (same WiFi, no PC server needed):</p>
+  <p><a id="editor-link" href="/editor/">http://omote.local/editor/</a></p>
+  <p class="muted">First time after a firmware update, install editor files to flash storage:
+    <code>pio run -e omote-rev4 -t uploadfs</code> (export a backup first — uploadfs erases stored layout).</p>
+  <p class="muted">Or on your PC use any free port, e.g.
+    <code>cd tools/web-editor &amp;&amp; python -m http.server 8081</code></p>
+  <p class="muted">While using the physical remote, avoid keeping large downloads open in the editor tab — it shares RAM with BLE/HA.</p>
+  <p><button type="button" id="btn-mem">Memory stats</button></p>
+  <pre id="mem-out" class="muted" style="font-size:0.8rem;max-height:120px;overflow:auto"></pre>
   <script>
     const base = location.origin;
     document.getElementById('ip').textContent = base;
-    document.getElementById('device-url').textContent = base;
+    const editorUrl = base + '/editor/';
+    const el = document.getElementById('editor-link');
+    el.href = editorUrl;
+    el.textContent = editorUrl;
     async function api(path, opts = {}) {
       const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
       const t = await r.text();
@@ -110,6 +117,16 @@ python -m http.server 8080</code></pre>
     document.getElementById('btn-ble-forget').onclick = async () => {
       if (!confirm('Forget all paired phones/TVs? You will need to pair again.')) return;
       await bleAction('/api/ble/forget', 'Bonds cleared. Pair your Google TV now.');
+    };
+    document.getElementById('btn-mem').onclick = async () => {
+      const out = document.getElementById('mem-out');
+      out.textContent = 'Loading…';
+      try {
+        const m = await api('/api/device/mem');
+        out.textContent = JSON.stringify(m, null, 2);
+      } catch (e) {
+        out.textContent = e.message;
+      }
     };
     load();
     refreshBle();

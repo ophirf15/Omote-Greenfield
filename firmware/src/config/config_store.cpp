@@ -92,14 +92,17 @@ void actionToJson(const ActionDef &action, JsonObject &obj) {
   }
 }
 
+static char configKeyCharFromJson(const String &keyStr);
+
 bool pageKeyFromJson(const JsonObject &obj, std::map<char, ActionDef> &keys) {
   keys.clear();
   for (JsonPair kv : obj) {
     String k = kv.key().c_str();
-    if (k.length() != 1) continue;
+    const char ch = configKeyCharFromJson(k);
+    if (!ch) continue;
     ActionDef act;
     if (kv.value().is<JsonObject>() && actionFromJson(kv.value().as<JsonObject>(), act)) {
-      keys[k[0]] = act;
+      keys[ch] = act;
     }
   }
   return true;
@@ -201,13 +204,20 @@ static void parsePages(const JsonArray &arr, std::vector<PageDef> &pages) {
   }
 }
 
+static char configKeyCharFromJson(const String &keyStr) {
+  if (keyStr.length() == 1) return keyStr[0];
+  if (keyStr.equalsIgnoreCase("POWER") || keyStr.equalsIgnoreCase("TV_POWER")) return 'o';
+  if (keyStr.equalsIgnoreCase("KEY_POWER")) return 'P';
+  return keyStr.length() ? keyStr[0] : 0;
+}
+
 static void parseKeymap(const JsonArray &arr, std::vector<KeyBinding> &keymap) {
   keymap.clear();
   for (JsonObject k : arr) {
     if (keymap.size() >= MAX_KEY_BINDINGS) break;
     KeyBinding kb;
     String keyStr = k["key"] | "";
-    if (keyStr.length()) kb.key = keyStr[0];
+    if (keyStr.length()) kb.key = configKeyCharFromJson(keyStr);
     kb.pageId = k["page_id"] | "";
     if (k["action"].is<JsonObject>()) {
       actionFromJson(k["action"].as<JsonObject>(), kb.action);
@@ -301,11 +311,51 @@ bool configLoad(OmoteConfig &cfg) {
 
 static bool writeTextFile(const char *path, const String &body) {
   File f = LittleFS.open(path, "w");
-  if (!f) return false;
-  const size_t n = f.print(body);
+  if (!f) {
+    Serial.printf("config write open failed: %s heap=%u max=%u\n", path, ESP.getFreeHeap(),
+                  ESP.getMaxAllocHeap());
+    return false;
+  }
+  size_t written = 0;
+  const char *data = body.c_str();
+  const size_t len = body.length();
+  while (written < len) {
+    const size_t chunk = min((size_t)512, len - written);
+    const size_t n = f.write((const uint8_t *)(data + written), chunk);
+    if (n == 0) {
+      f.close();
+      LittleFS.remove(path);
+      Serial.printf("config write failed at %u/%u\n", (unsigned)written, (unsigned)len);
+      return false;
+    }
+    written += n;
+    yield();
+  }
   f.close();
-  return n == body.length();
+  return written == len;
 }
+
+/** Scan config file for active_page_id without JsonDocument. */
+static bool configPeekActivePageId(const char *path, String &pageIdOut) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  String head;
+  head.reserve(512);
+  while (f.available() && head.length() < 2048) head += (char)f.read();
+  f.close();
+  const int keyAt = head.indexOf("\"active_page_id\"");
+  if (keyAt < 0) return false;
+  int q = head.indexOf('"', keyAt + 16);
+  if (q < 0) return false;
+  q = head.indexOf('"', q + 1);
+  if (q < 0) return false;
+  const int end = head.indexOf('"', q + 1);
+  if (end < 0) return false;
+  pageIdOut = head.substring(q + 1, end);
+  return pageIdOut.length() > 0;
+}
+
+enum class ConfigCommitReload { Auto, Defer, Force };
 
 /** Cheap file check — no JsonDocument (deploy often runs with <8 KB max alloc). */
 static bool configValidateFileQuick(const char *path, String &errorOut) {
@@ -388,7 +438,8 @@ static bool configValidateFile(const char *path, String &errorOut) {
   return true;
 }
 
-static bool configCommitTempFile(OmoteConfig &live, String &errorOut) {
+static bool configCommitTempFile(OmoteConfig &live, String &errorOut,
+                                 ConfigCommitReload reload = ConfigCommitReload::Auto) {
   if (!configValidateFile(CONFIG_TMP_PATH, errorOut)) {
     LittleFS.remove(CONFIG_TMP_PATH);
     return false;
@@ -405,17 +456,30 @@ static bool configCommitTempFile(OmoteConfig &live, String &errorOut) {
     errorOut = "commit failed";
     return false;
   }
-  configClearVectors(live);
-  yield();
-  if (!configLoadFromPath(live, CONFIG_PATH)) {
-    errorOut = "load failed";
-    return false;
+  const bool doReload =
+      reload == ConfigCommitReload::Force ||
+      (reload == ConfigCommitReload::Auto && ESP.getMaxAllocHeap() >= 16384);
+  if (doReload) {
+    configClearVectors(live);
+    yield();
+    if (!configLoadFromPath(live, CONFIG_PATH)) {
+      errorOut = "load failed";
+      return false;
+    }
+    configRepairActivePage(live);
+    size_t buttons = 0;
+    for (const auto &p : live.pages) buttons += p.buttons.size();
+    Serial.printf("config committed: %u pages, %u buttons, active=%s, heap=%u\n", live.pages.size(),
+                  buttons, live.activePageId.c_str(), ESP.getFreeHeap());
+    return true;
   }
-  configRepairActivePage(live);
-  size_t buttons = 0;
-  for (const auto &p : live.pages) buttons += p.buttons.size();
-  Serial.printf("config committed: %u pages, %u buttons, active=%s, heap=%u\n", live.pages.size(),
-                buttons, live.activePageId.c_str(), ESP.getFreeHeap());
+  String activeId;
+  if (configPeekActivePageId(CONFIG_PATH, activeId)) configPersistActivePageId(activeId);
+  File cf = LittleFS.open(CONFIG_PATH, "r");
+  const size_t bytesOnDisk = cf ? cf.size() : 0;
+  if (cf) cf.close();
+  Serial.printf("config committed to disk (%u bytes, reload on reboot) heap=%u max=%u\n",
+                (unsigned)bytesOnDisk, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   return true;
 }
 
@@ -443,7 +507,7 @@ bool configApplyPostBody(const String &body, OmoteConfig &live, String &errorOut
     return false;
   }
   Serial.println("config validate ok");
-  return configCommitTempFile(live, errorOut);
+  return configCommitTempFile(live, errorOut, ConfigCommitReload::Defer);
 }
 
 bool configPersistActivePageId(const String &pageId) {
