@@ -24,6 +24,11 @@
       <h2>Home Assistant</h2>
       <label>Device URL <input id="device-url" placeholder="http://omote.local" /></label>
       <button id="btn-save-device-url">Connect to device</button>
+      <div class="backup-actions">
+        <button type="button" id="btn-enter-sync-mode">Enter sync mode on remote</button>
+        <button type="button" id="btn-exit-sync-mode">Exit sync mode (reboot)</button>
+      </div>
+      <p class="muted small"><strong>On the remote first:</strong> swipe down → Settings → <em>Editor sync</em>, or hold the <strong>top power button ~3s</strong>. Then Connect here. (PC buttons below are optional.)</p>
       <label>HA URL <input id="ha-url" placeholder="http://homeassistant.local:8123" /></label>
       <label>Long-lived token <input id="ha-token" type="password" /></label>
       <p class="muted small">Layout entity lists use <strong>Home Assistant from this browser</strong> (not through Omote). Use your HA IP, e.g. <code>http://192.168.1.10:8123</code>. Add this editor origin (e.g. <code>http://omote.local</code> or <code>http://localhost:8081</code>) to <code>http.cors_allowed_origins</code> in <code>configuration.yaml</code>, then restart HA.</p>

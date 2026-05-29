@@ -17,6 +17,7 @@
 #include "net/net_worker.h"
 #include "net/net_heap.h"
 #include "net/runtime_diag.h"
+#include "net/editor_sync_mode.h"
 #include "net/time_sync.h"
 #include "hal/pins.h"
 #include "hal/power_btn_hal.h"
@@ -90,6 +91,8 @@ static std::vector<String> sLastHaEntityIds;
 static uint32_t sLastHaSubscribeMs = 0;
 static bool sHaSyncInProgress = false;
 static volatile bool sReloadPending = false;
+static bool gEditorSyncMode = false;
+static lv_obj_t *gEditorSyncPanel = nullptr;
 struct ToggleUi {
   lv_obj_t *sw = nullptr;
   size_t btnIndex = 0;
@@ -856,7 +859,7 @@ static void pageEngineReloadDone() {
 
 void pageEngineSyncHaToggles() { pageEngineApplyHaStore(); }
 void pageEngineOnSwipeDrag(int dx, int dy) {
-  if (gShowingSettings || gShowingKeyboard) return;
+  if (gEditorSyncMode || gShowingSettings || gShowingKeyboard) return;
   if (dy > 55 && abs(dy) > abs(dx) * 2) {
     gShowingSettings = true;
     pageEngineReload();
@@ -1387,6 +1390,12 @@ static void buildSettingsPanel() {
     y += 22;
   };
   row("Settings");
+  y += 2;
+  mkSettingsBtn(gSettingsPanel, "Editor sync", 8, y, SCR_WIDTH - 16, 34, [](lv_event_t *) {
+    gShowingSettings = false;
+    editorSyncModeEnter();
+  });
+  y += 40;
   row((String("WiFi: ") + wifiUiStateText()).c_str());
   row((String("IP: ") + (WiFi.localIP().toString().c_str())).c_str());
   row((String("Battery: ") + batteryPercent() + "%").c_str());
@@ -1767,8 +1776,78 @@ void pageEngineAfterAction(bool pageChanged) {
     displayRequestRefresh();
   }
 }
+static void buildEditorSyncPanel() {
+  if (gEditorSyncPanel) lv_obj_del(gEditorSyncPanel);
+  gEditorSyncPanel = lv_obj_create(gScreen);
+  lv_obj_set_size(gEditorSyncPanel, SCR_WIDTH, SCR_HEIGHT);
+  lv_obj_set_pos(gEditorSyncPanel, 0, 0);
+  lv_obj_set_style_bg_color(gEditorSyncPanel, lv_color_hex(0x0d1a2d), 0);
+  stripContainerStyle(gEditorSyncPanel);
+  lv_obj_clear_flag(gEditorSyncPanel, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  lv_obj_t *title = lv_label_create(gEditorSyncPanel);
+  lv_label_set_text(title, "Editor sync");
+  lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 48);
+  lv_obj_t *body = lv_label_create(gEditorSyncPanel);
+  lv_label_set_text(body,
+                    "PC editing mode\n\n"
+                    "BLE and Home Assistant\n"
+                    "are paused.\n\n"
+                    "On your PC open\n"
+                    "tools/web-editor and\n"
+                    "Connect to omote.local\n\n"
+                    "Deploy or press top\n"
+                    "power to reboot.");
+  lv_obj_set_style_text_color(body, lv_color_hex(0xcccccc), 0);
+  lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_width(body, SCR_WIDTH - 24);
+  lv_obj_align(body, LV_ALIGN_CENTER, 0, 12);
+}
+
+void pageEngineEnterEditorSync() {
+  if (!gScreen) return;
+  gEditorSyncMode = true;
+  gShowingSettings = false;
+  gShowingKeyboard = false;
+  sReloadPending = false;
+  sPageSwitchPending = false;
+  clearWidgets();
+  if (gSettingsPanel) {
+    lv_obj_del(gSettingsPanel);
+    gSettingsPanel = nullptr;
+  }
+  if (gStatusBar) {
+    lv_obj_del(gStatusBar);
+    gStatusBar = nullptr;
+    gBatLbl = nullptr;
+    gTitleLbl = nullptr;
+    gClockLbl = nullptr;
+  }
+  buildEditorSyncPanel();
+  displaySetBacklight(gDevSettings ? gDevSettings->brightness : 180);
+  displayRequestRefresh();
+  displayRefreshNow();
+}
+
+void pageEngineExitEditorSync() {
+  gEditorSyncMode = false;
+  if (gEditorSyncPanel) {
+    lv_obj_del(gEditorSyncPanel);
+    gEditorSyncPanel = nullptr;
+  }
+  pageEngineRequestReload();
+}
+
+bool pageEngineEditorSyncActive() { return gEditorSyncMode; }
+
 void pageEngineLoop() {
   if (displayIsOff()) return;
+  if (gEditorSyncMode) {
+    lv_timer_handler();
+    if (displayConsumeRefreshPending()) displayRefreshNow();
+    return;
+  }
 
   /* Touch + draw + page changes only — no blocking HA in this path. */
   diagSetStage("lvgl_timer");
@@ -1810,7 +1889,7 @@ void pageEngineLoop() {
 }
 
 void pageEngineLoopNetwork() {
-  if (displayIsOff()) return;
+  if (displayIsOff() || gEditorSyncMode) return;
   pageEnginePollHaAsync();
   if (diagHttpBusy()) return;
 
@@ -1887,6 +1966,7 @@ static bool dispatchKeyAction(char key) {
 }
 
 void pageEngineHandleKey(char key, bool pressed) {
+  if (gEditorSyncMode) return;
   if (!pressed || !gCfg || !gExec) return;
   Serial.printf("KEY pressed: '%c' active_page=%s\n", key, gExec->activePageId().c_str());
   sleepNotifyActivity();

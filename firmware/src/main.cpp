@@ -19,6 +19,7 @@
 #include "net/time_sync.h"
 #include "net/ha_async_worker.h"
 #include "net/ha_websocket.h"
+#include "net/editor_sync_mode.h"
 #include "net/net_heap.h"
 #include "ui_runtime/page_engine.h"
 
@@ -99,7 +100,18 @@ static void onConfigChanged() {
   pageEngineRequestReload();
 }
 
+static void onPowerLongPress() {
+  if (editorSyncModeActive()) return;
+  Serial.println("editor sync: enter (hold power)");
+  editorSyncModeEnter();
+}
+
 static void onKeypad(char key, bool pressed) {
+  if (editorSyncModeActive()) {
+    if (pressed && key == KEY_POWER) editorSyncModeExit(true);
+    return;
+  }
+  if (key == KEY_POWER && !pressed && powerBtnLongPressConsumed()) return;
   if (pressed && key) sleepNotifyActivity();
   if (key) httpServerPublishKey(key, pressed);
   pageEngineHandleKey(key, pressed);
@@ -192,7 +204,7 @@ void loop() {
   // Wake path: scan keys before UI work when the backlight is off.
   if (displayIsOff()) {
     keypadLoop(onKeypad);
-    powerBtnLoop(onKeypad);
+    powerBtnLoop(onKeypad, onPowerLongPress);
   }
 
   if (setupMode) {
@@ -229,11 +241,25 @@ void loop() {
     if (millis() - connectedSince > 800) startNetworkServices();
   }
 
+  if (editorSyncModeActive()) {
+    sleepNotifyActivity();
+    diagSetStage("ui");
+    pageEngineLoop();
+    diagSetStage("http");
+    httpServerLoop();
+    diagSetStage("ntp");
+    timeSyncLoop();
+    diagSetStage("loop");
+    diagMaybeReportStall();
+    delay(5);
+    return;
+  }
+
   diagSetStage("ui");
   pageEngineLoop();
   if (!displayIsOff()) {
     keypadLoop(onKeypad);
-    powerBtnLoop(onKeypad);
+    powerBtnLoop(onKeypad, onPowerLongPress);
   }
   diagSetStage("http");
   httpServerLoop();

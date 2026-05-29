@@ -14,6 +14,7 @@
 #include "net/net_heap.h"
 #include "net/runtime_diag.h"
 #include "net/time_sync.h"
+#include "net/editor_sync_mode.h"
 #include "ui_runtime/page_engine.h"
 #include <ESP.h>
 #include <WebServer.h>
@@ -240,8 +241,35 @@ static void handleApiStatus() {
     j += gConfig->activePageId;
     j += "\"";
   }
+  j += ",\"editor_sync\":";
+  j += editorSyncModeActive() ? "true" : "false";
+  const DeviceMemInfo mem = deviceMemSnapshot();
+  j += ",\"free_heap\":";
+  j += mem.freeHeap;
+  j += ",\"max_alloc_heap\":";
+  j += mem.maxAllocHeap;
   j += "}";
   sendJson(200, j);
+}
+
+static void handleEditorSyncMode() {
+  if (!server.hasArg("plain")) {
+    sendJson(400, "{\"error\":\"missing body\"}");
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    sendJson(400, "{\"error\":\"invalid json\"}");
+    return;
+  }
+  const bool on = doc["on"] | false;
+  if (on) {
+    editorSyncModeEnter();
+    sendJson(200, "{\"ok\":true,\"editor_sync\":true}");
+    return;
+  }
+  sendJson(200, "{\"ok\":true,\"editor_sync\":false,\"reboot\":true}");
+  scheduleDeviceRestart(200);
 }
 
 static void handleSettingsGet() {
@@ -720,6 +748,15 @@ void httpServerBegin(HaSettings &settings, OmoteConfig &config, DeviceSettings &
   server.on("/api/ha/ws", HTTP_POST, handleHaWs);
   server.on("/api/device/settings", HTTP_GET, handleDeviceSettingsGet);
   server.on("/api/device/settings", HTTP_POST, handleDeviceSettingsPost);
+  server.on("/api/device/sync-mode", HTTP_GET, []() {
+    JsonDocument doc;
+    doc["editor_sync"] = editorSyncModeActive();
+    String out;
+    serializeJson(doc, out);
+    sendJson(200, out);
+  });
+  server.on("/api/device/sync-mode", HTTP_POST, handleEditorSyncMode);
+  server.on("/api/device/sync-mode", HTTP_OPTIONS, handleCorsPreflight);
   server.on("/api/device/reboot", HTTP_POST, []() {
     sendJson(200, "{\"ok\":true}");
     delay(200);

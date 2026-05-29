@@ -1761,6 +1761,32 @@ async function loadConfig(opts = {}) {
   }
 }
 
+async function setEditorSyncMode(on) {
+  return api('/api/device/sync-mode', {
+    method: 'POST',
+    body: JSON.stringify({ on: !!on }),
+    timeoutMs: 20000,
+  });
+}
+
+async function refreshSyncModeUi() {
+  const enterBtn = $('btn-enter-sync-mode');
+  const exitBtn = $('btn-exit-sync-mode');
+  if (!enterBtn && !exitBtn) return false;
+  try {
+    applyApiBaseFromUi();
+    const st = await api('/api/status', { timeoutMs: 8000 });
+    const on = st.editor_sync === true;
+    if (enterBtn) enterBtn.disabled = on;
+    if (exitBtn) exitBtn.disabled = !on;
+    return on;
+  } catch {
+    if (enterBtn) enterBtn.disabled = false;
+    if (exitBtn) exitBtn.disabled = true;
+    return false;
+  }
+}
+
 async function connectToDevice(opts = {}) {
   const retries = opts.retries ?? 35;
   const silent = !!opts.silent;
@@ -1789,6 +1815,7 @@ async function connectToDevice(opts = {}) {
       $('setup-msg').textContent = '';
       $('setup-msg').classList.remove('error');
       $('editor-msg').classList.remove('error');
+      await refreshSyncModeUi();
       return true;
     } catch (e) {
       if (i === retries - 1) {
@@ -2219,6 +2246,17 @@ $('btn-deploy').onclick = async () => {
     if (!deviceConnected) {
       throw new Error('Not connected to Omote — set Device URL in Setup and click Connect first.');
     }
+    let st;
+    try {
+      st = await api('/api/status', { timeoutMs: 8000 });
+    } catch (_) {
+      st = {};
+    }
+    if (!st.editor_sync) {
+      $('editor-msg').textContent = 'Enabling sync mode on remote…';
+      await setEditorSyncMode(true);
+      await sleep(400);
+    }
     $('editor-msg').textContent = `Deploying ${expectedButtons} button(s) (${Math.round(payload.length / 1024)} KB)…`;
     $('editor-msg').classList.remove('error');
     let deployOk = false;
@@ -2616,6 +2654,34 @@ async function init() {
     saveEditorPrefs({ ha_token: $('ha-token').value.trim() });
   });
   $('btn-save-device-url')?.addEventListener('click', () => connectToDevice({ retries: 20 }));
+  $('btn-enter-sync-mode')?.addEventListener('click', async () => {
+    applyApiBaseFromUi();
+    $('setup-msg').textContent = 'Enabling sync mode…';
+    $('setup-msg').classList.remove('error');
+    try {
+      await setEditorSyncMode(true);
+      deviceConnected = true;
+      await refreshSyncModeUi();
+      $('setup-msg').textContent =
+        'Sync mode on — Omote paused BLE/HA. Edit layout, then Deploy (reboots when done).';
+    } catch (e) {
+      $('setup-msg').textContent = e.message || String(e);
+      $('setup-msg').classList.add('error');
+    }
+  });
+  $('btn-exit-sync-mode')?.addEventListener('click', async () => {
+    $('setup-msg').textContent = 'Rebooting Omote…';
+    $('setup-msg').classList.remove('error');
+    try {
+      await setEditorSyncMode(false);
+      deviceConnected = false;
+      $('setup-msg').textContent = 'Reboot sent — wait for omote.local, then Connect again.';
+      await refreshSyncModeUi();
+    } catch (e) {
+      $('setup-msg').textContent = e.message || String(e);
+      $('setup-msg').classList.add('error');
+    }
+  });
   initDomainTabs();
   initKeyDomainTabs();
   syncActionPanels();

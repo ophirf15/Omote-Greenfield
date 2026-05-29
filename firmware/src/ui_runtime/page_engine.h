@@ -21,3 +21,7 @@ void pageEngineLoop();
 /** Blocking HA work — call after pageEngineLoop() so swipes/touch stay responsive. */
 void pageEngineLoopNetwork();
 void pageEngineHandleKey(char key, bool pressed);
+/** Full-screen “editor sync” — remote paused for PC layout work. */
+void pageEngineEnterEditorSync();
+void pageEngineExitEditorSync();
+bool pageEngineEditorSyncActive();
