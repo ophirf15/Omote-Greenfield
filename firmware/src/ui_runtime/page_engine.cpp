@@ -1790,15 +1790,18 @@ static void buildEditorSyncPanel() {
   lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 48);
   lv_obj_t *body = lv_label_create(gEditorSyncPanel);
-  lv_label_set_text(body,
-                    "PC editing mode\n\n"
+  String bodyText = "PC editing mode\n\n"
                     "BLE and Home Assistant\n"
                     "are paused.\n\n"
                     "On your PC open\n"
                     "tools/web-editor and\n"
-                    "Connect to omote.local\n\n"
-                    "Deploy or press top\n"
-                    "power to reboot.");
+                    "Connect to omote.local\n";
+  if (WiFi.status() == WL_CONNECTED) {
+    bodyText += "\n" + WiFi.localIP().toString() + "\n";
+  }
+  bodyText += "\nDeploy or press Power (o)\n"
+              "to exit and reboot.";
+  lv_label_set_text(body, bodyText.c_str());
   lv_obj_set_style_text_color(body, lv_color_hex(0xcccccc), 0);
   lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_width(body, SCR_WIDTH - 24);

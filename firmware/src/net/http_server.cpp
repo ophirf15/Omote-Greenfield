@@ -1017,13 +1017,15 @@ void httpServerLoop() {
     ESP.restart();
   }
 
-  if (ESP.getFreeHeap() < 4500) {
+  const bool editorPriority = editorSyncModeActive();
+  const uint32_t heapDropThreshold = editorPriority ? 2800u : 4500u;
+  if (ESP.getFreeHeap() < heapDropThreshold) {
     httpServerDropClients();
     return;
   }
 
   WiFiClient client = server.client();
-  if (!netHeapOkForHaPost() && client && client.connected()) {
+  if (!editorPriority && !netHeapOkForHaPost() && client && client.connected()) {
     const String uri = server.uri();
     if (uri == "/api/config" || uri == "/api/backup/export" || uri.startsWith("/editor/")) {
       Serial.printf("http: drop heavy client free=%u max=%u uri=%s\n", ESP.getFreeHeap(),
@@ -1032,9 +1034,12 @@ void httpServerLoop() {
       return;
     }
   }
-  const uint32_t budgetEnd = millis() + (netHeapComfortable() ? 18 : 8);
+  const uint32_t budgetMs =
+      editorPriority ? 100u : (netHeapComfortable() ? 18u : 8u);
+  const int maxPasses = editorPriority ? 16 : 2;
+  const uint32_t budgetEnd = millis() + budgetMs;
   int passes = 0;
-  while ((int32_t)(millis() - budgetEnd) < 0 && passes < 2) {
+  while ((int32_t)(millis() - budgetEnd) < 0 && passes < maxPasses) {
     server.handleClient();
     yield();
     passes++;

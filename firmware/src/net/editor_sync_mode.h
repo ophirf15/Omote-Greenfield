@@ -2,6 +2,9 @@
 
 #include <Arduino.h>
 
+/** Matrix power key (GPIO power is KEY_POWER / 'P' in power_btn_hal.h). */
+constexpr char EDITOR_SYNC_EXIT_KEY = 'o';
+
 /** True while the device is paused for PC layout editing (BLE/HA/input off). */
 bool editorSyncModeActive();
 

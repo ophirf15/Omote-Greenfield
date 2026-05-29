@@ -1882,6 +1882,42 @@ async function bleControl(path, okMsg, msgEl) {
   }
 }
 
+function resolveTimezoneFromUi() {
+  const sel = $('dev-timezone');
+  if (!sel) return 'UTC0';
+  if (sel.value === '__custom__') {
+    const custom = $('dev-timezone-custom')?.value?.trim();
+    return custom || 'UTC0';
+  }
+  return sel.value;
+}
+
+function applyDeviceTimezoneUi(storedTz) {
+  const sel = $('dev-timezone');
+  if (!sel) return;
+  const tz = storedTz || 'UTC0';
+  let matched = false;
+  for (const opt of sel.options) {
+    if (opt.value === tz) {
+      sel.value = tz;
+      matched = true;
+      break;
+    }
+  }
+  if (!matched) {
+    sel.value = '__custom__';
+    if ($('dev-timezone-custom')) $('dev-timezone-custom').value = tz;
+  }
+  const wrap = $('dev-timezone-custom-wrap');
+  if (wrap) wrap.style.display = sel.value === '__custom__' ? '' : 'none';
+}
+
+function formatDeviceTimeDisplay(d) {
+  if (d?.time_synced && d?.device_time) return d.device_time.replace('T', ' ');
+  if (d?.time_synced) return 'synced';
+  return 'waiting for NTP…';
+}
+
 async function loadDeviceSettings() {
   const d = await api('/api/device/settings');
   $('dev-brightness').value = d.brightness ?? 180;
@@ -1890,10 +1926,14 @@ async function loadDeviceSettings() {
   );
   $('dev-deep-sleep').value = Math.round((d.deep_sleep_timeout_ms || 900000) / 1000);
   $('dev-motion').checked = d.motion_wake_enabled !== false;
+  if ($('dev-ntp-server')) $('dev-ntp-server').value = d.ntp_server || 'pool.ntp.org';
+  applyDeviceTimezoneUi(d.timezone);
+  if ($('dev-time-now')) $('dev-time-now').textContent = formatDeviceTimeDisplay(d);
   $('device-status').innerHTML = `
     <p>Battery: ${d.battery_percent ?? '?'}% ${d.battery_charging ? '(charging)' : ''}</p>
     <p>WiFi: ${d.wifi_connected ? d.wifi_ssid + ' @ ' + d.ip : 'offline'}</p>
-    <p>Screen: ${d.display_off ? 'off (WiFi on)' : 'on'}</p>`;
+    <p>Screen: ${d.display_off ? 'off (WiFi on)' : 'on'}</p>
+    <p>Clock: ${formatDeviceTimeDisplay(d)}</p>`;
   refreshBleUi().catch(() => {});
 }
 
@@ -2610,6 +2650,34 @@ $('btn-ble-test-button')?.addEventListener('click', () => {
   bleTestSend({ button: n }, `BUTTON_${n}`);
 });
 
+$('dev-timezone')?.addEventListener('change', () => {
+  const wrap = $('dev-timezone-custom-wrap');
+  if (wrap) wrap.style.display = $('dev-timezone').value === '__custom__' ? '' : 'none';
+});
+
+$('btn-save-time')?.addEventListener('click', async () => {
+  const msg = $('dev-time-msg');
+  try {
+    const tz = resolveTimezoneFromUi();
+    const ntp = $('dev-ntp-server')?.value?.trim() || 'pool.ntp.org';
+    await api('/api/device/settings', {
+      method: 'POST',
+      body: JSON.stringify({ timezone: tz, ntp_server: ntp }),
+    });
+    const d = await api('/api/device/settings');
+    if ($('dev-time-now')) $('dev-time-now').textContent = formatDeviceTimeDisplay(d);
+    if (msg) {
+      msg.textContent = 'Time settings saved — clock updates after NTP sync (up to ~30s).';
+      msg.classList.remove('error');
+    }
+  } catch (e) {
+    if (msg) {
+      msg.textContent = e.message || String(e);
+      msg.classList.add('error');
+    }
+  }
+});
+
 $('btn-save-device').onclick = async () => {
   await api('/api/device/settings', {
     method: 'POST',
@@ -2618,6 +2686,8 @@ $('btn-save-device').onclick = async () => {
       display_timeout_ms: parseInt($('dev-display-timeout').value, 10) * 1000,
       deep_sleep_timeout_ms: parseInt($('dev-deep-sleep').value, 10) * 1000,
       motion_wake_enabled: $('dev-motion').checked,
+      timezone: resolveTimezoneFromUi(),
+      ntp_server: $('dev-ntp-server')?.value?.trim() || 'pool.ntp.org',
     }),
   });
   alert('Device settings saved');

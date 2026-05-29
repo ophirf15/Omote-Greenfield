@@ -10,6 +10,7 @@
 #include "hal/ir_hal.h"
 #include "hal/keypad_hal.h"
 #include "hal/power_btn_hal.h"
+#include <WiFi.h>
 #include "hal/sleep_hal.h"
 #include "hal/wifi_hal.h"
 #include "net/debug_log.h"
@@ -108,7 +109,7 @@ static void onPowerLongPress() {
 
 static void onKeypad(char key, bool pressed) {
   if (editorSyncModeActive()) {
-    if (pressed && key == KEY_POWER) editorSyncModeExit(true);
+    if (pressed && (key == KEY_POWER || key == EDITOR_SYNC_EXIT_KEY)) editorSyncModeExit(true);
     return;
   }
   if (key == KEY_POWER && !pressed && powerBtnLongPressConsumed()) return;
@@ -238,20 +239,21 @@ void loop() {
   if (!servicesStarted && WiFi.status() == WL_CONNECTED) {
     static uint32_t connectedSince = 0;
     if (connectedSince == 0) connectedSince = millis();
-    if (millis() - connectedSince > 800) startNetworkServices();
+    const uint32_t servicesDelayMs = editorSyncModeActive() ? 0 : 800;
+    if (millis() - connectedSince > servicesDelayMs) startNetworkServices();
   }
 
   if (editorSyncModeActive()) {
     sleepNotifyActivity();
+    keypadLoop(onKeypad);
+    powerBtnLoop(onKeypad, onPowerLongPress);
     diagSetStage("ui");
     pageEngineLoop();
     diagSetStage("http");
     httpServerLoop();
-    diagSetStage("ntp");
-    timeSyncLoop();
     diagSetStage("loop");
     diagMaybeReportStall();
-    delay(5);
+    delay(2);
     return;
   }
 

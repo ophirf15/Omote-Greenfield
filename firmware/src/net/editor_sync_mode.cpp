@@ -5,6 +5,8 @@
 #include "net/ha_websocket.h"
 #include "ui_runtime/page_engine.h"
 #include <ESP.h>
+#include <WiFi.h>
+#include <ESPmDNS.h>
 
 static bool sActive = false;
 static uint32_t sSavedDisplayTimeoutMs = 0;
@@ -28,6 +30,14 @@ bool editorSyncModeEnter() {
   sleepSetDisplayTimeoutMs(30UL * 60UL * 1000UL);
   sleepSetDeepSleepTimeoutMs(0);
   sleepNotifyActivity();
+  /* Keep WiFi modem sleep enabled — ESP-IDF aborts on setSleep(false) while the BT
+   * controller is still registered for coexistence (even after bleShutdown()). */
+  if (WiFi.status() == WL_CONNECTED) {
+    if (MDNS.begin("omote")) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.printf("editor sync: mDNS omote.local (%s)\n", WiFi.localIP().toString().c_str());
+    }
+  }
   pageEngineEnterEditorSync();
   return true;
 }
