@@ -13,6 +13,9 @@ void netWorkerInit();
 void netWorkerTouchWebClient();
 bool netWorkerWebUiActive(uint32_t windowMs = 30000);
 
+/** Shorter HA timeouts for on-device button/toggle actions (call around execute). */
+void netWorkerSetPreferShortTimeout(bool preferShort);
+
 /** Single-flight HTTP to Home Assistant (mutex). */
 bool netWorkerHttpRequest(const HaSettings &s, const String &method, const String &path,
                           const String &body, int &httpCode, String &response);

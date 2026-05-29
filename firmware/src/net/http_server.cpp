@@ -11,6 +11,7 @@
 #include "net/debug_log.h"
 #include "net/ha_client.h"
 #include "net/net_worker.h"
+#include "net/runtime_diag.h"
 #include "net/time_sync.h"
 #include "ui_runtime/page_engine.h"
 #include <ESP.h>
@@ -676,6 +677,7 @@ void httpServerBegin(HaSettings &settings, OmoteConfig &config, DeviceSettings &
     serializeJson(doc, out);
     sendJson(200, out);
   });
+  server.on("/api/device/diag", HTTP_GET, []() { sendJson(200, diagSnapshotJson()); });
   server.on("/api/ir/learn/start", HTTP_POST, []() {
     irLearnStart();
     sendJson(200, "{\"ok\":true}");
@@ -899,5 +901,10 @@ void httpServerBegin(HaSettings &settings, OmoteConfig &config, DeviceSettings &
 
 void httpServerLoop() {
   if (!gServerUp) return;
-  server.handleClient();
+  for (int i = 0; i < 8; i++) {
+    server.handleClient();
+    yield();
+  }
+  WiFiClient client = server.client();
+  if (client && !client.connected()) client.stop();
 }

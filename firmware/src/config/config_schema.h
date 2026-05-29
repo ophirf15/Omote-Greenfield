@@ -3,6 +3,8 @@
 #include <Arduino.h>
 
 #define CONFIG_PATH "/config.json"
+/** Last swiped page only — tiny write so swipes never trigger full config.json save. */
+#define ACTIVE_PAGE_PATH "/active_page.txt"
 #define SETTINGS_PATH "/settings.json"
 #define DEVICE_SETTINGS_PATH "/device_settings.json"
 #define CONFIG_SCHEMA_VERSION 2

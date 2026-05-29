@@ -1,4 +1,5 @@
 #include "hal/display_hal.h"
+#include "net/runtime_diag.h"
 #include "hal/ble_hal.h"
 #include "hal/omote_i2c.h"
 #include "hal/pins.h"
@@ -59,12 +60,14 @@ static lv_color_t *buf1 = nullptr;
 static lv_color_t *buf2 = nullptr;
 
 static void lvglFlush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
+  diagFlushBegin();
   uint32_t w = area->x2 - area->x1 + 1;
   uint32_t h = area->y2 - area->y1 + 1;
   tft.startWrite();
   tft.setAddrWindow(area->x1, area->y1, w, h);
   tft.pushPixelsDMA(reinterpret_cast<uint16_t *>(&color_p->full), w * h);
   tft.endWrite();
+  diagFlushEnd();
   lv_disp_flush_ready(disp);
 }
 
@@ -107,6 +110,7 @@ static void lvglTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
 static bool sLedcActive = false;
 static uint32_t sFadeInStart = 0;
 static bool sDisplayOff = false;
+static bool sRefreshPending = false;
 
 static void backlightEnsurePwm() {
   if (!sLedcActive) displayBacklightInit();
@@ -231,12 +235,28 @@ void displayUpdateBacklight() {
   }
 }
 
+void displayRequestRefresh() {
+  sRefreshPending = true;
+  diagSetDisplayRefreshPending(true);
+}
+
+bool displayConsumeRefreshPending() {
+  if (!sRefreshPending) return false;
+  sRefreshPending = false;
+  diagSetDisplayRefreshPending(false);
+  return true;
+}
+
+void displayRefreshNow() {
+  lv_disp_t *disp = lv_disp_get_default();
+  if (disp) lv_refr_now(disp);
+}
+
 void displayPump() {
   for (int i = 0; i < 8; i++) {
     lv_timer_handler();
   }
-  lv_disp_t *disp = lv_disp_get_default();
-  if (disp) lv_refr_now(disp);
+  displayRefreshNow();
 }
 
 void displayInit() {

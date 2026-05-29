@@ -27,3 +27,8 @@ bool displayIsOff();
 void displayUpdateBacklight();
 /** Run LVGL handler and push a full redraw to the panel (call after blocking work). */
 void displayPump();
+/** Schedule a single lv_refr_now on the next pageEngineLoop tick (safe from LVGL events). */
+void displayRequestRefresh();
+void displayRefreshNow();
+/** Returns true once and clears the pending refresh flag. */
+bool displayConsumeRefreshPending();

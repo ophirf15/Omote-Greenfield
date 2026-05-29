@@ -286,6 +286,15 @@ bool configLoad(OmoteConfig &cfg) {
     configInstallDefault(cfg);
   }
   configRepairActivePage(cfg);
+  if (LittleFS.exists(ACTIVE_PAGE_PATH)) {
+    File f = LittleFS.open(ACTIVE_PAGE_PATH, "r");
+    if (f) {
+      String id = f.readString();
+      f.close();
+      id.trim();
+      if (id.length() && configFindPage(cfg, id)) cfg.activePageId = id;
+    }
+  }
   Serial.printf("config loaded (%u pages, active=%s)\n", cfg.pages.size(), cfg.activePageId.c_str());
   return true;
 }
@@ -435,6 +444,15 @@ bool configApplyPostBody(const String &body, OmoteConfig &live, String &errorOut
   }
   Serial.println("config validate ok");
   return configCommitTempFile(live, errorOut);
+}
+
+bool configPersistActivePageId(const String &pageId) {
+  if (pageId.length() == 0) return false;
+  File f = LittleFS.open(ACTIVE_PAGE_PATH, "w");
+  if (!f) return false;
+  const size_t n = f.print(pageId);
+  f.close();
+  return n == (size_t)pageId.length();
 }
 
 bool configSave(const OmoteConfig &cfg) {

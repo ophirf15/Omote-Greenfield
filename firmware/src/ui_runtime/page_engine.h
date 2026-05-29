@@ -16,4 +16,6 @@ void pageEngineUnloadUi();
 void pageEngineRequestReload();
 void pageEngineAfterAction(bool pageChanged);
 void pageEngineLoop();
+/** Blocking HA work — call after pageEngineLoop() so swipes/touch stay responsive. */
+void pageEngineLoopNetwork();
 void pageEngineHandleKey(char key, bool pressed);

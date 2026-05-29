@@ -105,9 +105,11 @@ bool haCallService(const HaSettings &s, const String &domain, const String &serv
 
 bool haStateIsOn(const String &state) {
   String s = state;
+  s.trim();
   s.toLowerCase();
-  if (s == "on" || s == "open" || s == "opening" || s == "playing" || s == "home" ||
-      s == "heat" || s == "cool" || s == "auto" || s == "unlocked" || s == "active") {
+  if (s == "on" || s == "true" || s == "1" || s == "yes" || s == "open" || s == "opening" ||
+      s == "playing" || s == "home" || s == "heat" || s == "cool" || s == "auto" ||
+      s == "unlocked" || s == "active") {
     return true;
   }
   return false;

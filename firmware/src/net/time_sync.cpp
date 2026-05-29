@@ -15,6 +15,7 @@ static String sActiveServer;
 static String sActiveTz;
 static bool sSynced = false;
 static uint32_t sLastSyncMs = 0;
+static uint32_t sNextNtpTryMs = 0;
 static uint32_t sSyncedUtcAtBoot = 0;
 static uint32_t sSyncedMillisAtBoot = 0;
 
@@ -152,7 +153,7 @@ static bool ntpQuery(const char *host, uint32_t &outUtc) {
     return false;
   }
 
-  const uint32_t deadline = millis() + 1500;
+  const uint32_t deadline = millis() + 400;
   while ((int32_t)(millis() - deadline) < 0) {
     if (udp.parsePacket() >= (int)sizeof(pkt)) {
       udp.read(pkt, sizeof(pkt));
@@ -163,30 +164,36 @@ static bool ntpQuery(const char *host, uint32_t &outUtc) {
       outUtc = secs - kNtpUnixOffset;
       return true;
     }
-    delay(20);
+    yield();
   }
   udp.stop();
   return false;
 }
 
-static bool ntpSyncOnce() {
+static bool ntpTryOneServer() {
   const char *servers[3] = {
       sActiveServer.length() ? sActiveServer.c_str() : "pool.ntp.org",
       "time.google.com",
       "time.cloudflare.com",
   };
-  for (const char *host : servers) {
-    uint32_t utc = 0;
-    if (ntpQuery(host, utc)) {
-      sSyncedUtcAtBoot = utc;
-      sSyncedMillisAtBoot = millis();
-      sSynced = true;
-      sLastSyncMs = millis();
-      Serial.printf("NTP: synced via %s (epoch=%lu)\n", host, (unsigned long)utc);
-      return true;
-    }
+  static uint8_t sServerIdx = 0;
+  const char *host = servers[sServerIdx];
+  sServerIdx = (sServerIdx + 1) % 3;
+  uint32_t utc = 0;
+  if (!ntpQuery(host, utc)) return false;
+  sSyncedUtcAtBoot = utc;
+  sSyncedMillisAtBoot = millis();
+  sSynced = true;
+  sLastSyncMs = millis();
+  sNextNtpTryMs = millis() + kResyncIntervalMs;
+  Serial.printf("NTP: synced via %s (epoch=%lu)\n", host, (unsigned long)utc);
+  return true;
+}
+
+static bool ntpSyncOnce() {
+  for (int i = 0; i < 3; i++) {
+    if (ntpTryOneServer()) return true;
   }
-  Serial.println("NTP: all servers failed");
   return false;
 }
 
@@ -194,7 +201,8 @@ void timeStartSync(const String &posixTz, const String &ntpServer) {
   sActiveTz = posixTz.length() ? posixTz : String("UTC0");
   parseTz(sActiveTz);
   sActiveServer = ntpServer.length() ? ntpServer : String("pool.ntp.org");
-  ntpSyncOnce();
+  sLastSyncMs = 0;
+  sNextNtpTryMs = 0;
 }
 
 void timeSetTimezone(const String &posixTz) {
@@ -202,13 +210,21 @@ void timeSetTimezone(const String &posixTz) {
   parseTz(sActiveTz);
 }
 
-void timeForceResync() { ntpSyncOnce(); }
+void timeForceResync() {
+  sNextNtpTryMs = 0;
+  ntpSyncOnce();
+}
 
 void timeSyncLoop() {
   if (WiFi.status() != WL_CONNECTED) return;
   const uint32_t now = millis();
-  if (sLastSyncMs && now - sLastSyncMs < kResyncIntervalMs) return;
-  ntpSyncOnce();
+  if (now < sNextNtpTryMs) return;
+  if (sSynced && sLastSyncMs && now - sLastSyncMs < kResyncIntervalMs) return;
+  if (!ntpTryOneServer()) {
+    /* Back off — do NOT retry every main-loop tick (was freezing UI for minutes). */
+    sNextNtpTryMs = now + 30000;
+    Serial.println("NTP: retry in 30s");
+  }
 }
 
 bool timeIsSynced() { return sSynced; }

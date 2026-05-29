@@ -1,4 +1,5 @@
 #include "net/net_worker.h"
+#include "net/runtime_diag.h"
 #include <HTTPClient.h>
 #include <WiFiClient.h>
 #include <freertos/FreeRTOS.h>
@@ -6,8 +7,10 @@
 
 static SemaphoreHandle_t gNetMutex = nullptr;
 static volatile uint32_t gLastWebClientMs = 0;
+static bool sPreferShortTimeout = false;
 
 static constexpr size_t kMaxGetResponseBytes = 16384;
+static constexpr size_t kMaxDrainBytes = 4096;
 
 static String normalizeUrl(const String &url) {
   String u = url;
@@ -16,18 +19,24 @@ static String normalizeUrl(const String &url) {
   return u;
 }
 
+void netWorkerSetPreferShortTimeout(bool preferShort) { sPreferShortTimeout = preferShort; }
+
 static void drainHttpBody(HTTPClient &http) {
   WiFiClient *stream = http.getStreamPtr();
   if (!stream) return;
   uint8_t buf[256];
-  const uint32_t deadline = millis() + 2000;
-  while ((http.connected() || stream->available()) && (int32_t)(millis() - deadline) < 0) {
+  size_t drained = 0;
+  const uint32_t deadline = millis() + 1500;
+  while ((http.connected() || stream->available()) && (int32_t)(millis() - deadline) < 0 &&
+         drained < kMaxDrainBytes) {
     const int n = stream->readBytes(buf, sizeof(buf));
     if (n <= 0) {
       if (!stream->available()) break;
-      delay(1);
+      yield();
       continue;
     }
+    drained += (size_t)n;
+    if ((drained & 0x3FF) == 0) yield();
   }
 }
 
@@ -43,11 +52,12 @@ static bool readCappedGetBody(HTTPClient &http, String &response) {
     const int n = stream->readBytes(buf, sizeof(buf));
     if (n <= 0) {
       if (!stream->available() && !http.connected()) break;
-      delay(1);
+      yield();
       continue;
     }
     total += (size_t)n;
     if (total <= kMaxGetResponseBytes) response.concat((const char *)buf, (unsigned)n);
+    if ((total & 0x3FF) == 0) yield();
   }
   return total > 0;
 }
@@ -84,15 +94,21 @@ bool netWorkerHttpRequest(const HaSettings &s, const String &method, const Strin
                           const String &body, int &httpCode, String &response) {
   if (!s.configured || !WiFi.isConnected()) return false;
   if (!gNetMutex) netWorkerInit();
-  if (xSemaphoreTake(gNetMutex, pdMS_TO_TICKS(12000)) != pdTRUE) {
+
+  const uint32_t mutexMs = sPreferShortTimeout ? 1500 : 12000;
+  const uint32_t timeoutMs =
+      sPreferShortTimeout ? 2500 : (netWorkerWebUiActive() ? 3500 : 6000);
+
+  if (xSemaphoreTake(gNetMutex, pdMS_TO_TICKS(mutexMs)) != pdTRUE) {
     Serial.println("net: HTTP busy timeout");
     return false;
   }
 
   HTTPClient http;
   WiFiClient client;
+  client.setTimeout(timeoutMs / 1000);
   String url = normalizeUrl(s.url) + path;
-  const uint32_t timeoutMs = netWorkerWebUiActive() ? 3500 : 6000;
+  diagHttpBegin(method.c_str(), path.c_str());
   http.setTimeout(timeoutMs);
   http.begin(client, url);
   http.addHeader("Authorization", "Bearer " + s.token);
@@ -100,21 +116,18 @@ bool netWorkerHttpRequest(const HaSettings &s, const String &method, const Strin
   response = "";
   if (method == "GET") {
     httpCode = http.GET();
-    if (httpCode > 0) {
-      if (!readCappedGetBody(http, response) && httpCode >= 200 && httpCode < 300) {
-        response = http.getString();
-      }
-    }
+    if (httpCode > 0) readCappedGetBody(http, response);
   } else if (method == "POST") {
     httpCode = http.POST(body);
-    /* homeassistant.toggle dumps the full entity state — never buffer it. */
     if (httpCode > 0) drainHttpBody(http);
   } else {
     http.end();
+    diagHttpEnd();
     xSemaphoreGive(gNetMutex);
     return false;
   }
   http.end();
+  diagHttpEnd();
   xSemaphoreGive(gNetMutex);
   return true;
 }

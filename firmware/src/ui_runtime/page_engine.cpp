@@ -12,6 +12,7 @@
 #include "net/ha_client.h"
 #include "hal/ha_icon_hal.h"
 #include "net/net_worker.h"
+#include "net/runtime_diag.h"
 #include "net/time_sync.h"
 #include "hal/pins.h"
 #include <ArduinoJson.h>
@@ -42,8 +43,31 @@ static lv_obj_t *gBleStatusLbl = nullptr;
 static uint8_t gKbLayer = 0;
 static bool gKbShift = false;
 static uint32_t sLastHaPoll = 0;
-static uint32_t sSavePageDeadline = 0;
+static uint32_t sHaPollNotBeforeMs = 0;
+static uint32_t sPageEngineBootMs = 0;
+static constexpr uint32_t kHaBootGraceMs = 25000;
+static constexpr uint32_t kHaPollIntervalMs = 8000;
+static constexpr uint32_t kEntityOptimisticMs = 8000;
+static uint32_t sPersistActivePageDeadline = 0;
+static uint32_t sUiBusyUntilMs = 0;
+static constexpr uint32_t kUiBusyAfterSwipeMs = 5000;
 static uint32_t sLastCycleMs = 0;
+static bool sClimateResyncPending = false;
+static uint32_t sHaUiQuietUntil = 0;
+static bool sPageSwitchPending = false;
+static uint32_t sClimateSyncNotBeforeMs = 0;
+static uint32_t sClimateLastOkMs = 0;
+static constexpr uint32_t kClimateRefreshMs = 45000;
+static constexpr uint32_t kClimateRetryMs = 2500;
+
+struct HaUiJob {
+  bool pending = false;
+  ActionDef action;
+  size_t btnIndex = SIZE_MAX;
+  bool isToggle = false;
+  bool wantOn = false;
+};
+static HaUiJob sHaUiJob;
 static bool sHaSyncInProgress = false;
 static volatile bool sReloadPending = false;
 static size_t sSkipToggleSyncIdx = SIZE_MAX;
@@ -84,9 +108,65 @@ struct ClimateThermostatUi {
 static std::vector<HaLabelUi> gHaLabels;
 static std::vector<HaClimateUi> gHaClimates;
 static ClimateThermostatUi gThermostat;
+
+struct EntityStateCacheEntry {
+  String entityId;
+  bool isOn = false;
+  uint32_t optimisticUntil = 0;
+};
+static std::vector<EntityStateCacheEntry> sEntityStateCache;
+static constexpr size_t kEntityCacheMax = 28;
+
+static EntityStateCacheEntry *entityCacheFind(const String &entityId) {
+  if (entityId.length() == 0) return nullptr;
+  for (auto &e : sEntityStateCache) {
+    if (e.entityId == entityId) return &e;
+  }
+  return nullptr;
+}
+
+static bool entityCacheGet(const String &entityId, bool &isOn) {
+  const EntityStateCacheEntry *e = entityCacheFind(entityId);
+  if (!e) return false;
+  isOn = e->isOn;
+  return true;
+}
+
+static void entityCachePut(const String &entityId, bool isOn) {
+  if (entityId.length() == 0) return;
+  if (EntityStateCacheEntry *e = entityCacheFind(entityId)) {
+    e->isOn = isOn;
+    return;
+  }
+  if (sEntityStateCache.size() >= kEntityCacheMax) {
+    sEntityStateCache.erase(sEntityStateCache.begin());
+  }
+  EntityStateCacheEntry ent;
+  ent.entityId = entityId;
+  ent.isOn = isOn;
+  sEntityStateCache.push_back(ent);
+}
+
+static void entityCacheMarkOptimistic(const String &entityId, bool isOn) {
+  if (entityId.length() == 0) return;
+  entityCachePut(entityId, isOn);
+  if (EntityStateCacheEntry *e = entityCacheFind(entityId)) {
+    const uint32_t until = millis() + kEntityOptimisticMs;
+    if (until > e->optimisticUntil) e->optimisticUntil = until;
+  }
+}
+
+static bool entityCacheIsOptimistic(const String &entityId) {
+  const EntityStateCacheEntry *e = entityCacheFind(entityId);
+  return e && millis() < e->optimisticUntil;
+}
+
 static lv_color_t hexToColor(uint32_t hex) { return lv_color_hex(hex & 0xFFFFFF); }
 static void stripContainerStyle(lv_obj_t *obj);
 static void cyclePage(int dir);
+static void updateStatusBarTitle();
+static void buildPageWidgets();
+static void pageEngineSwitchPageLight();
 static void makeTransparentContainer(lv_obj_t *obj) {
   stripContainerStyle(obj);
   lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, 0);
@@ -114,10 +194,19 @@ struct ClimateAttrs {
   bool hasRange = false;
   String mode;
 };
+struct ClimateCacheEntry {
+  String entityId;
+  ClimateAttrs attrs;
+};
+static ClimateCacheEntry sClimateCache;
 static bool parseClimateAttrs(const String &rawJson, ClimateAttrs &out) {
   static JsonDocument doc;
   doc.clear();
-  if (deserializeJson(doc, rawJson)) return false;
+  const DeserializationError err = deserializeJson(doc, rawJson);
+  if (err) {
+    Serial.printf("climate: JSON parse %s (%u bytes)\n", err.c_str(), rawJson.length());
+    return false;
+  }
   JsonObject attr = doc["attributes"];
   if (attr.isNull()) return false;
   out.mode = attr["hvac_mode"] | doc["state"].as<String>();
@@ -197,14 +286,8 @@ static void closeThermoModeMenu() {
   lv_obj_add_flag(gThermostat.modeMenu, LV_OBJ_FLAG_HIDDEN);
   gThermostat.menuOpen = false;
 }
-static void syncClimateThermostat() {
-  if (!gThermostat.panel || gThermostat.btnIndex >= gCachedButtons.size() || !gHaSettings) return;
-  const ButtonDef &btn = gCachedButtons[gThermostat.btnIndex];
-  if (btn.action.entityId.length() == 0) return;
-  String raw, err;
-  if (!haFetchEntityRaw(*gHaSettings, btn.action.entityId, raw, err)) return;
-  ClimateAttrs ca;
-  if (!parseClimateAttrs(raw, ca)) return;
+static void applyClimateAttrsToUi(const ClimateAttrs &ca) {
+  if (!gThermostat.panel) return;
   gThermostat.dualSetpoint = ca.hasRange;
   gThermostat.arcMin = ca.minT;
   gThermostat.arcMax = ca.maxT;
@@ -275,6 +358,84 @@ static void syncClimateThermostat() {
       lv_obj_add_flag(gThermostat.roomTick, LV_OBJ_FLAG_HIDDEN);
     }
   }
+}
+
+static bool climateCacheGet(const String &entityId, ClimateAttrs &out) {
+  if (entityId.length() == 0 || sClimateCache.entityId != entityId) return false;
+  out = sClimateCache.attrs;
+  return true;
+}
+
+static void climateCachePut(const String &entityId, const ClimateAttrs &ca) {
+  if (entityId.length() == 0) return;
+  sClimateCache.entityId = entityId;
+  sClimateCache.attrs = ca;
+}
+
+static String climateEntityForButton(const ButtonDef &btn) {
+  if (btn.action.entityId.length()) return btn.action.entityId;
+  if (btn.label.length() && btn.label.indexOf('.') > 0) return btn.label;
+  return String();
+}
+
+static void climateShowStatus(const char *msg) {
+  if (gThermostat.modeLbl) lv_label_set_text(gThermostat.modeLbl, msg);
+}
+
+static bool syncClimateThermostat() {
+  if (!gThermostat.panel || gThermostat.btnIndex >= gCachedButtons.size() || !gHaSettings) return false;
+  if (!gHaSettings->configured) {
+    climateShowStatus("HA not set");
+    return false;
+  }
+  if (!wifiIsConnected()) {
+    climateShowStatus("No WiFi");
+    return false;
+  }
+  const ButtonDef &btn = gCachedButtons[gThermostat.btnIndex];
+  const String entityId = climateEntityForButton(btn);
+  if (entityId.length() == 0) {
+    climateShowStatus("No entity");
+    return false;
+  }
+  String raw, err;
+  netWorkerSetPreferShortTimeout(true);
+  const bool ok = haFetchEntityRaw(*gHaSettings, entityId, raw, err);
+  netWorkerSetPreferShortTimeout(false);
+  if (ok) {
+    ClimateAttrs ca;
+    if (parseClimateAttrs(raw, ca)) {
+      climateCachePut(entityId, ca);
+      applyClimateAttrsToUi(ca);
+      sClimateLastOkMs = millis();
+      return true;
+    }
+    Serial.printf("climate: attrs parse failed %s\n", entityId.c_str());
+    climateShowStatus("Parse err");
+  } else {
+    Serial.printf("climate: fetch %s failed: %s\n", entityId.c_str(), err.c_str());
+    ClimateAttrs ca;
+    if (climateCacheGet(entityId, ca)) {
+      applyClimateAttrsToUi(ca);
+      climateShowStatus("Cached");
+      return true;
+    }
+    climateShowStatus("HA err");
+  }
+  return false;
+}
+
+static void scheduleClimateResync(uint32_t delayMs) {
+  sClimateResyncPending = true;
+  const uint32_t when = millis() + delayMs;
+  if (when > sClimateSyncNotBeforeMs) sClimateSyncNotBeforeMs = when;
+}
+
+static bool climateNeedsService() {
+  if (!gThermostat.panel) return false;
+  if (millis() < sClimateSyncNotBeforeMs) return false;
+  if (sClimateResyncPending || sClimateLastOkMs == 0) return true;
+  return millis() - sClimateLastOkMs >= kClimateRefreshMs;
 }
 static void buildClimateThermostat(const ButtonDef &btn, size_t idx) {
   (void)btn;
@@ -422,6 +583,18 @@ static void buildClimateThermostat(const ButtonDef &btn, size_t idx) {
   gThermostat.modeMenu = menu;
   gThermostat.btnIndex = idx;
   gThermostat.menuOpen = false;
+  const String entityId = climateEntityForButton(btn);
+  if (entityId.length()) {
+    ClimateAttrs ca;
+    if (climateCacheGet(entityId, ca)) {
+      applyClimateAttrsToUi(ca);
+      sClimateLastOkMs = millis();
+    } else {
+      scheduleClimateResync(300);
+    }
+  } else {
+    climateShowStatus("No entity");
+  }
 }
 static void haCallClimateTemp(size_t btnIndex, float target) {
   if (!gExec || btnIndex >= gCachedButtons.size() || !gHaSettings) return;
@@ -434,9 +607,7 @@ static void haCallClimateTemp(size_t btnIndex, float target) {
   dj["temperature"] = target;
   serializeJson(dj, act.dataJson);
   gExec->execute(act);
-  delay(60);
-  syncClimateThermostat();
-  displayPump();
+  sClimateResyncPending = true;
 }
 static void haCallClimateRange(size_t btnIndex, float low, float high) {
   if (!gExec || btnIndex >= gCachedButtons.size() || !gHaSettings) return;
@@ -450,9 +621,7 @@ static void haCallClimateRange(size_t btnIndex, float low, float high) {
   dj["target_temp_high"] = high;
   serializeJson(dj, act.dataJson);
   gExec->execute(act);
-  delay(60);
-  syncClimateThermostat();
-  displayPump();
+  sClimateResyncPending = true;
 }
 static void haCallClimateMode(size_t btnIndex, const char *mode) {
   if (!gExec || btnIndex >= gCachedButtons.size() || !gHaSettings) return;
@@ -465,9 +634,7 @@ static void haCallClimateMode(size_t btnIndex, const char *mode) {
   dj["hvac_mode"] = mode;
   serializeJson(dj, act.dataJson);
   gExec->execute(act);
-  delay(60);
-  syncClimateThermostat();
-  displayPump();
+  sClimateResyncPending = true;
 }
 static void onThermoAdjustBtn(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -476,7 +643,10 @@ static void onThermoAdjustBtn(lv_event_t *e) {
   const int which = (int)(packed & 3);  // 0 heat-, 1 heat+, 2 cool-, 3 cool+
   if (idx >= gCachedButtons.size()) return;
   String raw, err;
-  if (!haFetchEntityRaw(*gHaSettings, gCachedButtons[idx].action.entityId, raw, err)) return;
+  netWorkerSetPreferShortTimeout(true);
+  const bool got = haFetchEntityRaw(*gHaSettings, gCachedButtons[idx].action.entityId, raw, err);
+  netWorkerSetPreferShortTimeout(false);
+  if (!got) return;
   ClimateAttrs ca;
   if (!parseClimateAttrs(raw, ca)) return;
   if (ca.hasRange) {
@@ -508,7 +678,10 @@ static void onClimateTempBtn(lv_event_t *e) {
   const int delta = (packed & 1) ? 1 : -1;
   if (idx >= gCachedButtons.size()) return;
   String raw, err;
-  if (!haFetchEntityRaw(*gHaSettings, gCachedButtons[idx].action.entityId, raw, err)) return;
+  netWorkerSetPreferShortTimeout(true);
+  const bool got = haFetchEntityRaw(*gHaSettings, gCachedButtons[idx].action.entityId, raw, err);
+  netWorkerSetPreferShortTimeout(false);
+  if (!got) return;
   ClimateAttrs ca;
   if (!parseClimateAttrs(raw, ca)) return;
   float t = ca.target > 0 ? ca.target : readClimateTempNative(raw);
@@ -556,12 +729,32 @@ static void setSwitchChecked(lv_obj_t *sw, bool on, bool sendEvents) {
 }
 static size_t sHaSyncCursor = 0;
 
+static void scheduleHaPollAfter(uint32_t delayMs) {
+  const uint32_t when = millis() + delayMs;
+  if (when > sHaPollNotBeforeMs) sHaPollNotBeforeMs = when;
+}
+
+/** Block HA HTTP + climate sync while LVGL rebuilds after a swipe. */
+static void markUiBusy(uint32_t durationMs) {
+  const uint32_t until = millis() + durationMs;
+  if (until > sUiBusyUntilMs) sUiBusyUntilMs = until;
+  if (until > sHaUiQuietUntil) sHaUiQuietUntil = until;
+  if (until > sHaPollNotBeforeMs) sHaPollNotBeforeMs = until;
+  if (until > sClimateSyncNotBeforeMs) sClimateSyncNotBeforeMs = until;
+}
+
+static void pageEngineReloadDone() {
+  sHaSyncCursor = 0;
+  scheduleHaPollAfter(1500);
+  displayRequestRefresh();
+  diagSetStage("ui_loop");
+}
+
 static void pageEngineSyncHaBatch(int maxItems) {
   if (!gHaSettings || !gHaSettings->configured || !wifiIsConnected() || gShowingSettings) return;
-  if (gThermostat.panel) {
-    syncClimateThermostat();
-    return;
-  }
+  if (ESP.getFreeHeap() < 18000) return;
+  /* Climate state is fetched only when sClimateResyncPending — not every poll tick. */
+  if (gThermostat.panel) return;
   const size_t nT = gToggles.size();
   const size_t nL = gHaLabels.size();
   const size_t nC = gHaClimates.size();
@@ -577,9 +770,13 @@ static void pageEngineSyncHaBatch(int maxItems) {
       if (t.btnIndex == sSkipToggleSyncIdx && millis() < sSkipToggleSyncUntil) continue;
       const ButtonDef &btn = gCachedButtons[t.btnIndex];
       if (btn.action.entityId.length() == 0) continue;
+      if (entityCacheIsOptimistic(btn.action.entityId)) continue;
       String state, err;
       if (!haFetchEntityState(*gHaSettings, btn.action.entityId, state, err)) continue;
-      setSwitchChecked(t.sw, haStateIsOn(state), false);
+      if (state == "unavailable" || state == "unknown") continue;
+      const bool on = haStateIsOn(state);
+      entityCachePut(btn.action.entityId, on);
+      setSwitchChecked(t.sw, on, false);
     } else if (pass < nT + nL) {
       const auto &h = gHaLabels[pass - nT];
       if (h.btnIndex >= gCachedButtons.size() || !h.valueLbl) continue;
@@ -611,7 +808,7 @@ static void pageEngineSyncHaBatch(int maxItems) {
   }
 }
 
-void pageEngineSyncHaToggles() { pageEngineSyncHaBatch(3); }
+void pageEngineSyncHaToggles() { pageEngineSyncHaBatch(1); }
 void pageEngineOnSwipeDrag(int dx, int dy) {
   if (gShowingSettings || gShowingKeyboard) return;
   if (dy > 55 && abs(dy) > abs(dx) * 2) {
@@ -626,27 +823,37 @@ void pageEngineOnSwipeDrag(int dx, int dy) {
 static void saveActivePage() {
   if (gCfg && gExec) {
     gCfg->activePageId = gExec->activePageId();
-    sSavePageDeadline = millis() + 3000;
+    /* Tiny /active_page.txt write when idle — never configSave() on swipe (multi-second flash). */
+    sPersistActivePageDeadline = millis() + 15000;
   }
 }
 static void cyclePage(int dir) {
   if (!gCfg || !gExec || gCfg->pages.size() < 2) return;
   const uint32_t now = millis();
-  if (now - sLastCycleMs < 600) return;
+  if (now - sLastCycleMs < 250) return;
   sLastCycleMs = now;
   int idx = configPageIndex(*gCfg, gExec->activePageId());
   if (idx < 0) idx = 0;
   idx = (idx + dir + (int)gCfg->pages.size()) % (int)gCfg->pages.size();
   gExec->setActivePage(gCfg->pages[idx].id);
   saveActivePage();
+  markUiBusy(kUiBusyAfterSwipeMs);
   sleepNotifyActivity();
-  pageEngineReload();
+  sPageSwitchPending = true;
 }
 static bool runButtonAction(const ButtonDef &btn) {
   if (!gExec) return false;
   if (btn.action.type == ACTION_OPEN_KEYBOARD) {
     gShowingKeyboard = true;
-    pageEngineReload();
+    pageEngineRequestReload();
+    return true;
+  }
+  if (btn.action.type == ACTION_HA_SERVICE) {
+    sHaUiJob.action = btn.action;
+    sHaUiJob.isToggle = false;
+    sHaUiJob.btnIndex = SIZE_MAX;
+    sHaUiJob.pending = true;
+    diagSetTogglePending(true);
     return true;
   }
   String prevPage = gExec->activePageId();
@@ -656,29 +863,65 @@ static bool runButtonAction(const ButtonDef &btn) {
   pageEngineAfterAction(pageChanged);
   return ok;
 }
-static void runHaToggleAction(size_t idx) {
-  if (!gExec || idx >= gCachedButtons.size()) return;
-  const ButtonDef &btn = gCachedButtons[idx];
-  if (btn.action.type != ACTION_HA_SERVICE) return;
-  lv_obj_t *sw = nullptr;
-  bool wantOn = false;
-  for (const auto &t : gToggles) {
-    if (t.btnIndex == idx) {
-      sw = t.sw;
-      wantOn = sw && lv_obj_has_state(sw, LV_STATE_CHECKED);
-      break;
+
+static void applyToggleHaService(ActionDef &act, bool wantOn) {
+  String svc = act.service;
+  svc.toLowerCase();
+  if (svc.length() == 0 || svc == "toggle") {
+    act.service = wantOn ? "turn_on" : "turn_off";
+  }
+  String dom = act.domain;
+  haResolveHaCall(dom, act.service, act.entityId);
+  act.domain = dom;
+}
+
+static void processHaUiJob() {
+  if (!sHaUiJob.pending) return;
+  if (millis() < sUiBusyUntilMs) return;
+
+  HaUiJob job = sHaUiJob;
+  sHaUiJob.pending = false;
+  diagSetTogglePending(false);
+
+  if (job.isToggle) applyToggleHaService(job.action, job.wantOn);
+
+  netWorkerSetPreferShortTimeout(true);
+  diagSetStage("ha_ui");
+
+  String prevPage = gExec ? gExec->activePageId() : "";
+  bool ok = gExec ? gExec->execute(job.action) : false;
+
+  netWorkerSetPreferShortTimeout(false);
+
+  if (job.isToggle && job.btnIndex < gCachedButtons.size()) {
+    const ButtonDef &btn = gCachedButtons[job.btnIndex];
+    Serial.printf("HA %s %s: %s\n", job.action.service.c_str(), btn.action.entityId.c_str(),
+                  ok ? "ok" : "fail");
+    lv_obj_t *sw = nullptr;
+    for (const auto &t : gToggles) {
+      if (t.btnIndex == job.btnIndex) {
+        sw = t.sw;
+        break;
+      }
     }
+    if (ok) {
+      sSkipToggleSyncIdx = job.btnIndex;
+      sSkipToggleSyncUntil = millis() + kEntityOptimisticMs;
+      entityCacheMarkOptimistic(btn.action.entityId, job.wantOn);
+      if (sw) setSwitchChecked(sw, job.wantOn, false);
+    } else if (sw) {
+      entityCachePut(btn.action.entityId, !job.wantOn);
+      if (EntityStateCacheEntry *ent = entityCacheFind(btn.action.entityId)) ent->optimisticUntil = 0;
+      setSwitchChecked(sw, !job.wantOn, false);
+    }
+  } else if (ok && gExec && gExec->activePageId() != prevPage) {
+    pageEngineAfterAction(true);
   }
-  bool ok = gExec->execute(btn.action);
-  Serial.printf("HA toggle %s: %s\n", btn.action.entityId.c_str(), ok ? "ok" : "fail");
-  if (ok) {
-    sSkipToggleSyncIdx = idx;
-    sSkipToggleSyncUntil = millis() + 2500;
-    if (sw) setSwitchChecked(sw, wantOn, false);
-  } else if (sw) {
-    setSwitchChecked(sw, !wantOn, false);
-  }
-  displayPump();
+
+  sHaUiQuietUntil = millis() + 1500;
+  scheduleHaPollAfter(kEntityOptimisticMs);
+  diagSetStage("ui_loop");
+  displayRequestRefresh();
   sleepNotifyActivity();
 }
 static void onBtnEvent(lv_event_t *e) {
@@ -689,26 +932,51 @@ static void onBtnEvent(lv_event_t *e) {
   lv_obj_t *target = lv_event_get_target(e);
   if (btn.widget == WIDGET_MOMENTARY) {
     if (code == LV_EVENT_PRESSED) {
+      diagLvglEventEnter("btn_press");
       lv_obj_add_state(target, LV_STATE_PRESSED);
-      displayPump();
+      displayRequestRefresh();
+      diagLvglEventLeave();
     } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+      diagLvglEventEnter("btn_release");
       lv_obj_clear_state(target, LV_STATE_PRESSED);
       if (code == LV_EVENT_RELEASED) runButtonAction(btn);
-      else displayPump();
+      else displayRequestRefresh();
+      diagLvglEventLeave();
     }
     sleepNotifyActivity();
     return;
   }
   if (code != LV_EVENT_CLICKED) return;
+  diagLvglEventEnter("btn_click");
   runButtonAction(btn);
+  diagLvglEventLeave();
   sleepNotifyActivity();
 }
 static void onToggleChanged(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   if (sHaSyncInProgress) return;
-  runHaToggleAction((size_t)lv_event_get_user_data(e));
+  diagLvglEventEnter("toggle");
+  const size_t idx = (size_t)lv_event_get_user_data(e);
+  if (idx >= gCachedButtons.size()) {
+    diagLvglEventLeave();
+    return;
+  }
+  lv_obj_t *sw = lv_event_get_target(e);
+  const ButtonDef &btn = gCachedButtons[idx];
+  const bool wantOn = sw && lv_obj_has_state(sw, LV_STATE_CHECKED);
+  if (btn.action.entityId.length()) entityCacheMarkOptimistic(btn.action.entityId, wantOn);
+  sHaUiJob.action = btn.action;
+  sHaUiJob.btnIndex = idx;
+  sHaUiJob.isToggle = true;
+  sHaUiJob.wantOn = wantOn;
+  sHaUiJob.pending = true;
+  diagSetTogglePending(true);
+  diagLvglEventLeave();
+  sleepNotifyActivity();
 }
 static void clearWidgets() {
+  sClimateResyncPending = false;
+  sClimateLastOkMs = 0;
   for (auto *w : gWidgets) {
     if (w) lv_obj_del(w);
   }
@@ -1055,6 +1323,8 @@ void pageEngineSetHaSettings(HaSettings *ha) { gHaSettings = ha; }
 void pageEngineInit(OmoteConfig *config, ActionExecutor *executor) {
   gCfg = config;
   gExec = executor;
+  sPageEngineBootMs = millis();
+  sHaPollNotBeforeMs = sPageEngineBootMs + kHaBootGraceMs;
   gScreen = lv_scr_act();
   lv_obj_set_size(gScreen, SCR_WIDTH, SCR_HEIGHT);
   lv_obj_set_style_bg_color(gScreen, lv_color_hex(0x111111), 0);
@@ -1067,6 +1337,7 @@ void pageEngineInit(OmoteConfig *config, ActionExecutor *executor) {
   stripContainerStyle(gContent);
   tuneTouchGestures();
   pageEngineReload();
+  displayRefreshNow();
 }
 void pageEngineRequestReload() { sReloadPending = true; }
 
@@ -1095,6 +1366,7 @@ void pageEngineUnloadUi() {
 
 void pageEngineReload() {
   if (!gCfg || !gExec) return;
+  diagSetStage("ui_reload");
   clearWidgets();
   if (gSettingsPanel) {
     lv_obj_del(gSettingsPanel);
@@ -1103,10 +1375,12 @@ void pageEngineReload() {
   buildStatusBar();
   if (gShowingSettings) {
     buildSettingsPanel();
+    pageEngineReloadDone();
     return;
   }
   if (gShowingKeyboard) {
     buildKeyboardPanel();
+    pageEngineReloadDone();
     return;
   }
   if (!wifiIsConnected() &&
@@ -1115,6 +1389,7 @@ void pageEngineReload() {
     gOverlayMsg = lv_label_create(gScreen);
     lv_label_set_text(gOverlayMsg, wifiUiStateText());
     lv_obj_center(gOverlayMsg);
+    pageEngineReloadDone();
     return;
   }
   String pageId = gExec->activePageId();
@@ -1130,27 +1405,62 @@ void pageEngineReload() {
     gOverlayMsg = lv_label_create(gScreen);
     lv_label_set_text(gOverlayMsg, "No pages — deploy layout from web UI");
     lv_obj_center(gOverlayMsg);
+    pageEngineReloadDone();
     return;
   }
   gCachedPageId = pageId;
   gCachedButtons = page->buttons;
-  int iconQueued = 0;
-  for (const auto &b : gCachedButtons) {
-    if (iconQueued >= 4) break;
-    if (b.haIcon.length() >= 5 && b.haIcon.startsWith("mdi:")) {
-      haIconQueueFetch(b.haIcon);
-      iconQueued++;
-    }
-  }
   sHaSyncCursor = 0;
   for (size_t ti = 0; ti < gCachedButtons.size(); ti++) {
     if (gCachedButtons[ti].widget == WIDGET_CLIMATE_THERMOSTAT) {
       buildClimateThermostat(gCachedButtons[ti], ti);
-      pageEngineSyncHaToggles();
-      sLastHaPoll = millis();
+      scheduleClimateResync(400);
+      pageEngineReloadDone();
       return;
     }
   }
+  buildPageWidgets();
+  pageEngineReloadDone();
+}
+
+static void updateStatusBarTitle() {
+  if (!gTitleLbl || !gCfg || !gExec) return;
+  const PageDef *p = configFindPage(*gCfg, gExec->activePageId());
+  lv_label_set_text(gTitleLbl, p ? p->name.c_str() : "Omote");
+}
+
+static void pageEngineSwitchPageLight() {
+  if (!gCfg || !gExec || !gContent || gShowingSettings || gShowingKeyboard) {
+    pageEngineRequestReload();
+    return;
+  }
+  markUiBusy(kUiBusyAfterSwipeMs);
+  diagSetStage("ui_switch");
+  clearWidgets();
+  updateStatusBarTitle();
+
+  const PageDef *page = configFindPage(*gCfg, gExec->activePageId());
+  if (!page) {
+    pageEngineRequestReload();
+    return;
+  }
+  gCachedPageId = gExec->activePageId();
+  gCachedButtons = page->buttons;
+  sHaSyncCursor = 0;
+
+  for (size_t ti = 0; ti < gCachedButtons.size(); ti++) {
+    if (gCachedButtons[ti].widget == WIDGET_CLIMATE_THERMOSTAT) {
+      buildClimateThermostat(gCachedButtons[ti], ti);
+      scheduleClimateResync(kUiBusyAfterSwipeMs);
+      diagSetStage("ui_loop");
+      return;
+    }
+  }
+  buildPageWidgets();
+  diagSetStage("ui_loop");
+}
+
+static void buildPageWidgets() {
   for (size_t i = 0; i < gCachedButtons.size(); i++) {
     const auto &btn = gCachedButtons[i];
     lv_obj_t *w = nullptr;
@@ -1176,6 +1486,10 @@ void pageEngineReload() {
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
       }
       lv_obj_add_event_cb(w, onToggleChanged, LV_EVENT_VALUE_CHANGED, (void *)i);
+      bool cachedOn = false;
+      if (btn.action.entityId.length() && entityCacheGet(btn.action.entityId, cachedOn)) {
+        setSwitchChecked(w, cachedOn, false);
+      }
       gWidgets.push_back(row);
       ToggleUi tu;
       tu.sw = w;
@@ -1298,48 +1612,101 @@ void pageEngineReload() {
       gWidgets.push_back(w);
     }
   }
-  sLastHaPoll = millis();
 }
+
 void pageEngineAfterAction(bool pageChanged) {
   if (pageChanged) {
-    pageEngineReload();
+    markUiBusy(kUiBusyAfterSwipeMs);
+    sPageSwitchPending = true;
   } else {
     buildStatusBar();
-    displayPump();
+    displayRequestRefresh();
   }
 }
 void pageEngineLoop() {
+  if (displayIsOff()) return;
+
+  /* Touch + draw + page changes only — no blocking HA in this path. */
+  diagSetStage("lvgl_timer");
+  lv_timer_handler();
+  if (displayConsumeRefreshPending()) displayRefreshNow();
+  diagSetStage("ui_loop");
+
+  if (sPageSwitchPending) {
+    sPageSwitchPending = false;
+    pageEngineSwitchPageLight();
+    displayRequestRefresh();
+  }
+
   if (sReloadPending) {
     sReloadPending = false;
     pageEngineReload();
+    displayRequestRefresh();
   }
-  if (sSavePageDeadline && millis() >= sSavePageDeadline) {
-    sSavePageDeadline = 0;
-    if (gCfg) configSave(*gCfg);
-  }
-  if (displayIsOff()) return;
-  lv_timer_handler();
-  if (wifiIsConnected() && gOverlayMsg) pageEngineReload();
+
   static uint32_t lastBar = 0;
   static uint32_t lastClock = 0;
   const uint32_t now = millis();
-  if (now - lastBar > 5000) {
+  if (now - lastBar > 5000 && millis() >= sUiBusyUntilMs) {
     lastBar = now;
     buildStatusBar();
-    displayPump();
+    displayRequestRefresh();
   } else if (gClockLbl && now - lastClock > 1000) {
     lastClock = now;
     char hm[8];
     if (timeGetLocalHm(hm, sizeof(hm))) {
       lv_label_set_text(gClockLbl, hm);
+      displayRequestRefresh();
     }
   }
-  if (gHaSettings && gHaSettings->configured && wifiIsConnected() && !netWorkerWebUiActive() &&
-      (!gToggles.empty() || !gHaLabels.empty() || !gHaClimates.empty() || gThermostat.panel) &&
-      millis() - sLastHaPoll > 1500) {
-    sLastHaPoll = millis();
+
+  if (displayConsumeRefreshPending()) displayRefreshNow();
+}
+
+void pageEngineLoopNetwork() {
+  if (displayIsOff()) return;
+  if (diagHttpBusy()) return;
+
+  /* HVAC data: highest priority while thermostat is visible (retry until success). */
+  if (climateNeedsService()) {
+    const bool uiBusy = millis() < sUiBusyUntilMs;
+    if (!uiBusy || sClimateLastOkMs == 0) {
+      diagSetStage("ha_climate_sync");
+      if (syncClimateThermostat()) {
+        sClimateResyncPending = false;
+      } else {
+        scheduleClimateResync(kClimateRetryMs);
+      }
+      displayRequestRefresh();
+      diagSetStage("ui_loop");
+      return;
+    }
+  }
+
+  if (millis() < sUiBusyUntilMs || netWorkerWebUiActive()) return;
+
+  if (sPersistActivePageDeadline && millis() >= sPersistActivePageDeadline) {
+    sPersistActivePageDeadline = 0;
+    if (gExec) configPersistActivePageId(gExec->activePageId());
+    return;
+  }
+
+  if (sHaUiJob.pending) {
+    processHaUiJob();
+    return;
+  }
+
+  const uint32_t now = millis();
+  const bool haPollDue =
+      (now >= sHaPollNotBeforeMs) && (now - sPageEngineBootMs >= kHaBootGraceMs) &&
+      (sLastHaPoll == 0 || now - sLastHaPoll >= kHaPollIntervalMs);
+  if (gHaSettings && gHaSettings->configured && wifiIsConnected() && millis() >= sHaUiQuietUntil &&
+      haPollDue && (!gToggles.empty() || !gHaLabels.empty() || !gHaClimates.empty())) {
+    sLastHaPoll = now;
+    diagSetStage("ha_poll");
     pageEngineSyncHaToggles();
-    displayPump();
+    displayRequestRefresh();
+    diagSetStage("ui_loop");
   }
 }
 void pageEngineHandleKey(char key, bool pressed) {

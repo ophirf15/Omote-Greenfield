@@ -15,6 +15,7 @@
 #include "net/debug_log.h"
 #include "net/http_server.h"
 #include "net/net_worker.h"
+#include "net/runtime_diag.h"
 #include "net/time_sync.h"
 #include "ui_runtime/page_engine.h"
 
@@ -159,6 +160,8 @@ void setup() {
 }
 
 void loop() {
+  diagLoopHeartbeat();
+  diagSetStage("loop");
   displayUpdateBacklight();
 
   // Wake path: scan keys before UI work when the backlight is off.
@@ -179,6 +182,7 @@ void loop() {
     if (wifiPollConnect(30000)) {
       wifiConnectPending = false;
       pageEngineReload();
+      displayRefreshNow();
     } else if (wifiUiState() == WIFI_UI_FAILED) {
       Serial.println("WiFi failed — opening setup AP");
       wifiConnectPending = false;
@@ -200,14 +204,21 @@ void loop() {
     if (millis() - connectedSince > 800) startNetworkServices();
   }
 
+  diagSetStage("ui");
   pageEngineLoop();
   if (!displayIsOff()) {
     keypadLoop(onKeypad);
     powerBtnLoop(onKeypad);
   }
+  diagSetStage("http");
   httpServerLoop();
+  diagSetStage("ha_net");
+  pageEngineLoopNetwork();
+  diagSetStage("ntp");
   timeSyncLoop();
   bleTaskLoop();
+  diagSetStage("loop");
+  diagMaybeReportStall();
 
   static uint32_t activityTimer = 0;
   const uint32_t activityInterval = displayIsOff() ? 50 : 100;

@@ -233,7 +233,10 @@ void haIconQueueFetch(const String &mdiIcon) {
 
 void haIconClearQueue() { sFetchQueue = ""; }
 
-void haIconClearAll() { gIcons.clear(); }
+void haIconClearAll() {
+  std::vector<IconInstance> freed;
+  gIcons.swap(freed);
+}
 
 void haIconLoop() {
   /* Downloads run on dedicated task — never call HTTP/PNG from loopTask. */

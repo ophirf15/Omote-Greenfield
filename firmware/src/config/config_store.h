@@ -102,6 +102,8 @@ void configRepairActivePage(OmoteConfig &cfg);
 /** Write POST body to disk, validate, commit; reboot to load into RAM. */
 bool configApplyPostBody(const String &body, OmoteConfig &live, String &errorOut);
 bool configSave(const OmoteConfig &cfg);
+/** Fast persist of active_page_id only (for swipe navigation). */
+bool configPersistActivePageId(const String &pageId);
 bool settingsLoad(HaSettings &s);
 bool settingsSave(const HaSettings &s);
 bool deviceSettingsLoad(DeviceSettings &ds);
