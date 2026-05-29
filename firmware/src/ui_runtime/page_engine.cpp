@@ -895,6 +895,7 @@ static bool runButtonAction(const ButtonDef &btn) {
     return true;
   }
   if (btn.action.type == ACTION_HA_SERVICE) {
+    haStateStoreAbortBootstrap();
     sHaUiJob.action = btn.action;
     sHaUiJob.isToggle = false;
     sHaUiJob.btnIndex = SIZE_MAX;
@@ -1098,6 +1099,7 @@ static void onToggleChanged(lv_event_t *e) {
   const ButtonDef &btn = cachedButton(idx);
   const bool wantOn = sw && lv_obj_has_state(sw, LV_STATE_CHECKED);
   if (btn.action.entityId.length()) haStateStoreMarkOptimistic(btn.action.entityId, wantOn, kEntityOptimisticMs);
+  haStateStoreAbortBootstrap();
   sHaUiJob.action = btn.action;
   sHaUiJob.btnIndex = idx;
   sHaUiJob.isToggle = true;
@@ -1812,6 +1814,12 @@ void pageEngineLoopNetwork() {
   pageEnginePollHaAsync();
   if (diagHttpBusy()) return;
 
+  /* Toggles/buttons beat background entity state refresh (single ha_async slot). */
+  if (sHaUiJob.pending && !sHaUiAsyncInFlight && !sClimateAsyncCall) {
+    processHaUiJob();
+    return;
+  }
+
   if (sPendingHaSubscribe && sNetworkServicesReady && netHeapOkForHa() &&
       !netWorkerWebUiActive(2000)) {
     haSubscribeCurrentPage();
@@ -1819,7 +1827,7 @@ void pageEngineLoopNetwork() {
 
   if (!gThermostat.panel && gHaSettings && gHaSettings->configured && wifiIsConnected() &&
       sNetworkServicesReady && netHeapOkForHaGet() && !netWorkerWebUiActive(8000) &&
-      millis() - sLastBootstrapMs >= 400) {
+      !sHaUiJob.pending && !sHaUiAsyncInFlight && millis() - sLastBootstrapMs >= 400) {
     sLastBootstrapMs = millis();
     if (haStateStoreBootstrapTick(*gHaSettings)) {
       pageEngineApplyHaStore();
@@ -1843,16 +1851,11 @@ void pageEngineLoopNetwork() {
     }
   }
 
-  if (millis() < sUiBusyUntilMs || netWorkerWebUiActive()) return;
+  if (millis() < sUiBusyUntilMs || netWorkerWebUiActive(1500)) return;
 
   if (sPersistActivePageDeadline && millis() >= sPersistActivePageDeadline) {
     sPersistActivePageDeadline = 0;
     if (gExec) configPersistActivePageId(gExec->activePageId());
-    return;
-  }
-
-  if (sHaUiJob.pending && !sHaUiAsyncInFlight && !sClimateAsyncCall) {
-    processHaUiJob();
     return;
   }
 }

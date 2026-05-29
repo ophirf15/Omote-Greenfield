@@ -41,11 +41,8 @@ def _sync_data_sources(target, source, env):
                 shutil.copy2(sp, dp)
 
 
+# Editor on omote.local is optional (~118 KB). Only copy into LittleFS when you run uploadfs.
 if os.path.isdir(editor_src) or os.path.isdir(web_dist):
-    env.AddPreAction(
-        "buildprog",
-        env.Action(_sync_data_sources, "Sync web editor -> firmware/data/editor"),
-    )
     env.AddPreAction(
         "uploadfs",
         env.Action(_sync_data_sources, "Sync web assets before uploadfs"),

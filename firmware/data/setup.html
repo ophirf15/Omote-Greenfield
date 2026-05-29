@@ -39,12 +39,12 @@
   <p id="ble-msg" class="muted"></p>
   <hr />
   <h2>Layout editor</h2>
-  <p>Open the editor on this device (same WiFi, no PC server needed):</p>
-  <p><a id="editor-link" href="/editor/">http://omote.local/editor/</a></p>
-  <p class="muted">First time after a firmware update, install editor files to flash storage:
-    <code>pio run -e omote-rev4 -t uploadfs</code> (export a backup first — uploadfs erases stored layout).</p>
-  <p class="muted">Or on your PC use any free port, e.g.
-    <code>cd tools/web-editor &amp;&amp; python -m http.server 8081</code></p>
+  <p class="muted">Layout editor: run on your PC (recommended until HA integration), e.g.
+    <code>cd tools/web-editor &amp;&amp; python -m http.server 8081</code>
+    — set device URL to <code id="device-url">http://omote.local</code>.</p>
+  <p class="muted">Optional: host editor on-device (~118&nbsp;KB flash) with
+    <code>pio run -e omote-rev4 -t uploadfs</code> then open
+    <a id="editor-link" href="/editor/">/editor/</a> (export backup first — uploadfs wipes layout).</p>
   <p class="muted">While using the physical remote, avoid keeping large downloads open in the editor tab — it shares RAM with BLE/HA.</p>
   <p><button type="button" id="btn-mem">Memory stats</button></p>
   <pre id="mem-out" class="muted" style="font-size:0.8rem;max-height:120px;overflow:auto"></pre>
